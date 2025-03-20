@@ -118,4 +118,3 @@ def parse_irl_cfg(task_name: str, args_cli: argparse.Namespace) -> IrlRunnerCfg:
         irl_cfg.neptune_project = args_cli.log_project_name
 
     return irl_cfg
-
