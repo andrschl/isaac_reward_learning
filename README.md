@@ -1,16 +1,11 @@
 # isaac_reward_learning (Reward Learning Library for Robotic Manipulation)
-[**Training**](#training)
+[**Installation**](#installation) | [**Training**](#training)
 | [**Contributing**](#contributing)
 
 Library for inverse reinforcement learning and RLHF for robotic manipulation.
 
-<figure>
-  <video controls loop width="480">
-    <source src="assets/irl_policy.mp4" type="video/mp4">
-    Your browser does not support the video tag.
-  </video>
-  <figcaption>Demonstration of the learned IRL policy.</figcaption>
-</figure>
+#### Demonstration of the learned IRL policy for the FrankaLift environment:
+https://github.com/user-attachments/assets/043eda2d-802c-453d-8986-7400e60af5c0
 
 ## Installation
 1. Install IsaacLab v2.0 following the instructions in on the [IsaacLab documentation](https://isaac-sim.github.io/IsaacLab/v2.0.2/source/setup/installation/index.html).
