@@ -13,8 +13,9 @@ https://github.com/user-attachments/assets/043eda2d-802c-453d-8986-7400e60af5c0
 3. Activate the virtual environment with the isaaclab installation and `run python -m pip install -e source/isaac_reward_learning`
 
 ## Training
+To record data and run IRL training, run the following commands:
 - `python scripts/rsl_rl/train_rl.py --task Isaac-Lift-Cube-Franka-v0 --headless`
-- `python scripts/utils/record_synthetic_demos.py --task Isaac-Lift-Cube-Franka-v0 --num_demos 1000`
+- `python scripts/recording/record_synthetic_demos.py --task Isaac-Lift-Cube-Franka-v0 --num_demos 1000`
 - `python scripts/irl/train_irl.py --task Isaac-Lift-Cube-Franka-v0 --headless --expert_data_path 'logs/rsl_rl/franka_lift/demos/hdf_dataset.hdf5'`
 
 ## Contributing
