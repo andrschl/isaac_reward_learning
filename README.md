@@ -4,6 +4,14 @@
 
 Library for inverse reinforcement learning and RLHF for robotic manipulation.
 
+<figure>
+  <video controls loop width="480">
+    <source src="assets/irl_policy.mp4" type="video/mp4">
+    Your browser does not support the video tag.
+  </video>
+  <figcaption>Demonstration of the learned IRL policy.</figcaption>
+</figure>
+
 ## Installation
 1. Install IsaacLab v2.0 following the instructions in on the [IsaacLab documentation](https://isaac-sim.github.io/IsaacLab/v2.0.2/source/setup/installation/index.html).
 2. Clone this repository
