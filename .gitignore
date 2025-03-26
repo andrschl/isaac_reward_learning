@@ -5,3 +5,4 @@ source/isaaclab_rl/
 source/isaaclab_tasks/
 
 apps/
+wandb/

@@ -77,6 +77,8 @@ singularity exec \
         /isaac-sim/python.sh -m pip install --upgrade pip &&
         /isaac-sim/python.sh -m pip install --upgrade pip setuptools wheel &&
         /isaac-sim/python.sh -m pip install -e source/isaac_reward_learning &&
+        export WANDB_USERNAME=sebastien-epfl-epfl &&
+        export WANDB_API_KEY=377aa0f3fcfdedeeed6ad9a746b76bb67204b0e9 &&
         /isaac-sim/python.sh ${CLUSTER_PYTHON_EXECUTABLE} ${@:3}
     "
 
