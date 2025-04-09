@@ -194,8 +194,10 @@ case $command in
         # Check if singularity image exists on the remote host
         check_singularity_image_exists isaac-lab-$profile
         # make sure target directory exists
-        ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_ISAACLAB_DIR"
+        ssh -X $CLUSTER_LOGIN "mkdir -p $CLUSTER_ISAACLAB_DIR"
         # Sync Isaac Lab code
+        echo "Do we have x11 forwarding?"
+        echo $DISPLAY 
         echo "[INFO] Syncing Isaac Lab code..."
         rsync -rh  --exclude="*.git*" --filter=':- .dockerignore'  /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_ISAACLAB_DIR
         # execute job script

@@ -3,6 +3,6 @@ source/isaaclab_assets/
 source/isaaclab_mimic/
 source/isaaclab_rl/
 source/isaaclab_tasks/
-
+logs/
 apps/
 wandb/

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from isaac_reward_learning.modules import RewardModel
+from isaac_reward_learning.modules import DiscriminatorModel
 from isaac_reward_learning.storage import ExpertRolloutStorage, ImitatorRolloutStorage
 
 from rsl_rl.algorithms import PPO
@@ -12,19 +12,19 @@ from rsl_rl.storage import RolloutStorage
 
 class GAIL:
     rl_alg: PPO
-    reward: RewardModel
+    discriminator: DiscriminatorModel
 
     def __init__(
         self,
         rl_alg,
-        reward,
+        discriminator,
         expert_data_path="",
         max_rollout_length=128,
         batch_size=256,
         num_learning_epochs=1,
         weight_decay=1e-6,
         max_grad_norm=1.0,
-        reward_loss_coef=1.0,
+        discriminator_loss_coef=1.0,
         device="cpu",
     ):
         self.device = device
@@ -33,17 +33,18 @@ class GAIL:
         self.rl_alg = rl_alg
 
         # IRL components
-        self.reward = reward.to(self.device)
+        self.discriminator = discriminator.to(self.device)
         self.expert_data_path = expert_data_path
         self.expert_storage = None  # initialized later
         self.imitator_storage = None  # initialized later
         self.transition = RolloutStorage.Transition()
-        self.reward_optimizer = optim.RMSprop(self.reward.parameters(), lr=rl_alg.learning_rate, weight_decay=weight_decay)
+        self.discriminator_optimizer = optim.RMSprop(self.discriminator.parameters(), lr=rl_alg.learning_rate, weight_decay=weight_decay)
+        self.discriminator_criterion = nn.BCEWLoss()
 
         # IRL parameters
         self.batch_size = batch_size
         self.num_learning_epochs = num_learning_epochs
-        self.reward_loss_coef = reward_loss_coef
+        self.discriminator_loss_coef = discriminator_loss_coef
         self.max_grad_norm = max_grad_norm
         self.max_rollout_length = max_rollout_length
 
@@ -63,11 +64,11 @@ class GAIL:
 
     def eval_mode(self):
         self.rl_alg.actor_critic.eval()
-        self.reward.eval()
+        self.discriminator.eval()
 
     def train_mode(self):
         self.rl_alg.actor_critic.train()
-        self.reward.train()
+        self.discriminator.train()
 
     def act(self, obs):
         # Compute the actions and values
@@ -80,9 +81,9 @@ class GAIL:
         self.transition.dones = dones
         self.imitator_storage.add_transition(self.transition)
 
-    def reward_update(self):
+    def discriminatot_update(self):
 
-        mean_reward_loss = 0
+        mean_discriminator_loss = 0
         expert_generator = self.expert_storage.mini_batch_generator(self.batch_size, 10**100)    # 10**100 is a large number of epochs
         imitator_generator = self.imitator_storage.mini_batch_generator(self.batch_size, self.num_learning_epochs)
         
@@ -93,25 +94,25 @@ class GAIL:
             num_imitator_samples
         ) in enumerate(imitator_generator):
            
-            # Reward loss
-            expert_obs_batch, expert_actions_batch, expert_time_ids, num_expert_samples = next(expert_generator)
-            current_rewards = self.reward(obs_batch, actions_batch)
-            expert_rewards = self.reward(expert_obs_batch, expert_actions_batch)
-            
             # GAIL loss
-            imitator_loss = -torch.log(current_rewards + 1e-8).mean()
-            expert_loss = -torch.log(1 - expert_rewards + 1e-8).mean()
-            reward_loss = imitator_loss + expert_loss
+            expert_obs_batch, expert_actions_batch, expert_time_ids, num_expert_samples = next(expert_generator)
+            
+            g_o = self.discriminator(obs_batch, actions_batch)
+            e_o = self.discriminator(expert_obs_batch, expert_actions_batch)
+            
+            g_o_labels = torch.ones_like(g_o)
+            e_o_labels = torch.zeros_like(e_o)
+            discriminator_loss = self.discriminator_criterion(g_o, g_o_labels) + self.discriminator_criterion(e_o, e_o_labels)
 
             # Gradient step
-            self.reward_optimizer.zero_grad()
-            reward_loss.backward()
-            reward_gradient_norm = nn.utils.clip_grad_norm_(self.reward.parameters(), self.max_grad_norm)
-            self.reward_optimizer.step()
+            self.discriminator_optimizer.zero_grad()
+            discriminator_loss.backward()
+            discriminator_gradient_norm = nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
+            self.discriminator_optimizer.step()
 
-            mean_reward_loss += reward_loss.item()
+            mean_discriminator_loss += discriminator_loss.item()
 
         num_updates = i + 1
-        mean_reward_loss /= num_updates
+        mean_discriminator_loss /= num_updates
 
-        return mean_reward_loss, reward_gradient_norm
+        return mean_discriminator_loss, discriminator_gradient_norm
