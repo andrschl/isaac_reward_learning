@@ -4,9 +4,6 @@
 
 Library for inverse reinforcement learning and RLHF for robotic manipulation.
 
-#### Demonstration of the learned IRL policy for the FrankaLift environment:
-https://github.com/user-attachments/assets/043eda2d-802c-453d-8986-7400e60af5c0
-
 ## Installation
 1. Install IsaacLab v2.0 following the instructions in on the [IsaacLab documentation](https://isaac-sim.github.io/IsaacLab/v2.0.2/source/setup/installation/index.html).
 2. Clone this repository
