@@ -148,10 +148,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir
     agent_cfg["agent"]["experiment"]["wandb"] = True
     agent_cfg["agent"]["experiment"]["wandb_kwargs"] = {
-        "project": "GAIL_SCITAS",
+        "project": "GAIL_sycamore",
         "entity": "sebastien-epfl-epfl",
         "name": log_dir,
     }
+    # set the wandb api key if not already set
+    if "WANDB_API_KEY" not in os.environ:
+        print("Wandb API key not set. Setting it now.")
+        os.environ["WANDB_API_KEY"] = "377aa0f3fcfdedeeed6ad9a746b76bb67204b0e9"
     # update log_dir
     log_dir = os.path.join(log_root_path, log_dir)
 
