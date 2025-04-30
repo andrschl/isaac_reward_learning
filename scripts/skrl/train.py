@@ -41,7 +41,7 @@ parser.add_argument(
     "--algorithm",
     type=str,
     default="PPO",
-    choices=["AMP", "PPO", "IPPO", "MAPPO"],
+    choices=["AMP", "PPO", "IPPO", "MAPPO", "GAIL"],
     help="The RL algorithm used for training the skrl agent.",
 )
 
@@ -103,7 +103,9 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # config shortcuts
 algorithm = args_cli.algorithm.lower()
 agent_cfg_entry_point = "skrl_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_{algorithm}_cfg_entry_point"
-
+print("Hydra configuration:")
+print(args_cli.task)
+print(agent_cfg_entry_point)
 
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
@@ -146,7 +148,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir
     agent_cfg["agent"]["experiment"]["wandb"] = True
     agent_cfg["agent"]["experiment"]["wandb_kwargs"] = {
-        "project": "GAIL",
+        "project": "GAIL_SCITAS",
         "entity": "sebastien-epfl-epfl",
         "name": log_dir,
     }
@@ -186,6 +188,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
+    print("[INFO] Creating skrl runner.")
+    print_dict(agent_cfg, nesting=4)
     runner = Runner(env, agent_cfg)
 
     # load checkpoint (if specified)

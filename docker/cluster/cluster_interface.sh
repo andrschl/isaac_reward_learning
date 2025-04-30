@@ -199,7 +199,7 @@ case $command in
         echo "Do we have x11 forwarding?"
         echo $DISPLAY 
         echo "[INFO] Syncing Isaac Lab code..."
-        rsync -rh  --exclude="*.git*" --filter=':- .dockerignore'  /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_ISAACLAB_DIR
+        rsync -rh --exclude="*.git*" --exclude="logs/" --filter=':- .dockerignore' /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_ISAACLAB_DIR
         # execute job script
         echo "[INFO] Executing job script..."
         # check whether the second argument is a profile or a job argument

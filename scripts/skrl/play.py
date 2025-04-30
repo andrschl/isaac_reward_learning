@@ -87,7 +87,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
-main
+
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path, load_cfg_from_registry, parse_env_cfg
 

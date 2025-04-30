@@ -87,9 +87,10 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
-main
+
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path, load_cfg_from_registry, parse_env_cfg
+import numpy as np
 
 # config shortcuts
 algorithm = args_cli.algorithm.lower()
@@ -163,7 +164,7 @@ def main():
     experiment_cfg["agent"]["experiment"]["checkpoint_interval"] = 0  # don't generate checkpoints
     runner = Runner(env, experiment_cfg)
 
-    print(f"[INFO] Loading model checkpoint from: {resume_path}")
+    print(f"[INFO] Loading model checkpoint from: {resume_path}", flush=True)
     runner.agent.load(resume_path)
     # set agent to evaluation mode
     runner.agent.set_running_mode("eval")
@@ -171,9 +172,14 @@ def main():
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+    states_names = ['states', 'actions']
+    state_action_pairs = {n: [] for n in states_names}
+
     # simulate environment
-    while simulation_app.is_running():
+    for i in range(1000):
         start_time = time.time()
+        if i % 100 == 0:
+            print(f"[INFO] Step: {i}", flush=True)
 
         # run everything in inference mode
         with torch.inference_mode():
@@ -185,8 +191,13 @@ def main():
             # - single-agent (deterministic) actions
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
+            # record state and action
+            states = env._get_observations()
+            state_action_pairs["states"].append(states.cpu())
+            state_action_pairs["actions"].append(actions.cpu())
             # env stepping
             obs, _, _, _, _ = env.step(actions)
+
         if args_cli.video:
             timestep += 1
             # exit the play loop after recording one video
@@ -197,6 +208,10 @@ def main():
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    # save state-action pairs to npz file
+    print(f"[INFO] Saving state-action pairs to {log_dir}/state_action_pairs.npz", flush=True)
+    np.savez(os.path.join(log_dir, "full_state_action_pairs.npz"), **state_action_pairs)
 
     # close the simulator
     env.close()

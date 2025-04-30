@@ -74,14 +74,17 @@ singularity exec \
         cd /workspace/isaaclab &&
         /isaac-sim/python.sh -m pip uninstall -y toml &&
         /isaac-sim/python.sh -m pip install toml &&
+        /isaac-sim/python.sh -m pip show toml &&      
         /isaac-sim/python.sh -m pip install --upgrade pip &&
         /isaac-sim/python.sh -m pip install --upgrade pip setuptools wheel &&
-        /isaac-sim/python.sh -m pip install -e source/isaac_reward_learning &&
+        /isaac-sim/python.sh -m pip install -e source/isaaclab_tasks &&
         export WANDB_USERNAME=sebastien-epfl-epfl &&
         export WANDB_API_KEY=377aa0f3fcfdedeeed6ad9a746b76bb67204b0e9 &&
+        echo $TMPDIR &&
         /isaac-sim/python.sh ${CLUSTER_PYTHON_EXECUTABLE} ${@:3}
     "
-
+        # export ACCEPT_EULA=Y &&
+        # /isaac-sim/runheadless.sh
 # copy resulting cache files back to host
 rsync -azPv $TMPDIR/docker-isaac-sim $CLUSTER_ISAAC_SIM_CACHE_DIR/..
 

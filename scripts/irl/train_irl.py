@@ -10,6 +10,8 @@ from isaaclab.app import AppLauncher
 import cli_args as cli_args  # isort: skip
 from cli_args import parse_irl_cfg
 
+from skrl.agents.torch.amp import AMP
+
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")

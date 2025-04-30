@@ -88,17 +88,19 @@ class Runner:
         # memory
         elif name == "randommemory":
             from skrl.memories.torch import RandomMemory as component
+        elif name == "customrandommemory":
+            from scripts.skrl.memory.random_memory import CustomRandomMemory as component
         # agent
         elif name in ["a2c", "a2c_default_config"]:
             from skrl.agents.torch.a2c import A2C, A2C_DEFAULT_CONFIG
 
             component = A2C_DEFAULT_CONFIG if "default_config" in name else A2C
         elif name in ["amp", "amp_default_config"]:
-            from skrl.agents.torch.amp import AMP, AMP_DEFAULT_CONFIG
+            from scripts.skrl.algorithm.amp import AMP, AMP_DEFAULT_CONFIG
 
             component = AMP_DEFAULT_CONFIG if "default_config" in name else AMP
         elif name in ["gail", "gail_default_config"]:
-            from scripts.skrl.gail import GAIL, GAIL_DEFAULT_CONFIG
+            from scripts.skrl.algorithm.gail import GAIL, GAIL_DEFAULT_CONFIG
 
             component = GAIL_DEFAULT_CONFIG if "default_config" in name else GAIL
         elif name in ["cem", "cem_default_config"]:
@@ -167,6 +169,7 @@ class Runner:
             "state_preprocessor",
             "value_preprocessor",
             "amp_state_preprocessor",
+            "amp_action_preprocessor",
             "noise",
             "smooth_regularization_noise",
         ]
@@ -381,6 +384,8 @@ class Runner:
             agent_cfg["state_preprocessor_kwargs"].update({"size": observation_spaces[agent_id], "device": device})
             agent_cfg["value_preprocessor_kwargs"].update({"size": 1, "device": device})
             agent_cfg["amp_state_preprocessor_kwargs"].update({"size": amp_observation_space, "device": device})
+            if agent_class == "gail":
+                agent_cfg["amp_action_preprocessor_kwargs"].update({"size": action_spaces[agent_id], "device": device})
 
             motion_dataset = None
             if cfg.get("motion_dataset"):
