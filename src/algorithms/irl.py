@@ -22,6 +22,8 @@ class IRLCfg:
     """IRL-specific hyperparameters/config."""
 
     expert_data_path: str = ""
+    expert_num_trajectories: int | None = None  # None = use all; int = max trajectories for ablations
+    expert_subset_strategy: str = "first"  # "first" | "random"
     batch_size: int = 256
     num_learning_epochs: int = 1
     weight_decay: float = 1e-6
@@ -270,10 +272,16 @@ class IRL:
             expert_returns = self._eval_expected_return(expert_feats, expert_mask)
             reward_loss = float(self.cfg.reward_loss_coef) * (current_returns - expert_returns)
 
+            reg_loss = self.reward.get_regularization_loss()
+            loss = reward_loss + reg_loss
+
             self.reward_optimizer.zero_grad(set_to_none=True)
-            reward_loss.backward()
+            loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(self.reward.parameters(), float(self.cfg.max_grad_norm))
             self.reward_optimizer.step()
+
+            self.reward.apply_proximal_step()
+            self.reward.project_weights()
 
             total_reward_loss += float(reward_loss.item())
             total_grad_norm += float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)

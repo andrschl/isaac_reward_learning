@@ -8,6 +8,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+# Add project root so storage, utils are importable
+_root = Path(__file__).resolve().parents[1]
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 
 def _load_train_irl_module():
     root = Path(__file__).resolve().parents[1]
@@ -64,8 +69,11 @@ def test_load_feature_episodes_accepts_named_hdf5_payload(tmp_path: Path):
     assert len(episodes) == 2
     assert episodes[0].shape == (3, 2)
     assert episodes[1].shape == (4, 2)
-    assert torch.allclose(episodes[0][:, 0], torch.ones(3))
-    assert torch.allclose(episodes[0][:, 1], 2.0 * torch.ones(3))
+    # Feature columns are sorted by name: "lift" < "reach"
+    assert torch.allclose(episodes[0][:, 0], 2.0 * torch.ones(3))  # lift
+    assert torch.allclose(episodes[0][:, 1], torch.ones(3))  # reach
+    assert torch.allclose(episodes[1][:, 0], torch.ones(4))  # lift
+    assert torch.allclose(episodes[1][:, 1], torch.zeros(4))  # reach
 
 
 def test_load_feature_episodes_rejects_legacy_hdf5_matrix_payload(tmp_path: Path):
@@ -98,3 +106,51 @@ def test_load_feature_episodes_rejects_feature_dim_mismatch(tmp_path: Path):
 
     with pytest.raises(ValueError, match="feature dim mismatch"):
         module.load_feature_episodes(str(payload_path), expected_feature_dim=2)
+
+
+def test_subset_episodes_first_returns_first_n():
+    module = _load_train_irl_module()
+    episodes = [
+        torch.ones(2, 2),
+        torch.ones(3, 2) * 2,
+        torch.ones(4, 2) * 3,
+    ]
+    out = module._subset_episodes(episodes, max_num=2, strategy="first", seed=42)
+    assert len(out) == 2
+    assert torch.allclose(out[0], episodes[0])
+    assert torch.allclose(out[1], episodes[1])
+
+
+def test_subset_episodes_random_same_seed_returns_same_subset():
+    module = _load_train_irl_module()
+    episodes = [torch.ones(i + 1, 2) * i for i in range(10)]
+    out_a = module._subset_episodes(episodes, max_num=3, strategy="random", seed=123)
+    out_b = module._subset_episodes(episodes, max_num=3, strategy="random", seed=123)
+    assert len(out_a) == 3
+    assert len(out_b) == 3
+    for a, b in zip(out_a, out_b):
+        assert torch.allclose(a, b)
+
+
+def test_make_expert_buffer_loader_with_max_num_trajectories_loads_subset(tmp_path: Path):
+    module = _load_train_irl_module()
+    payload_path = tmp_path / "expert.pt"
+    torch.save(
+        {"episodes": [torch.ones(2, 2), torch.ones(3, 2), torch.ones(4, 2)]},
+        payload_path,
+    )
+
+    from utils.runtime_context import RuntimeContext
+    from storage.feature_storage import FeatureBufCfg, FeatureTrajectoryBuffer
+
+    loader = module._make_expert_buffer_loader(
+        str(payload_path),
+        expected_feature_dim=2,
+        max_num_trajectories=1,
+        subset_strategy="first",
+        seed=42,
+    )
+    ctx = RuntimeContext(num_envs=1, feature_dim=2)
+    buffer = FeatureTrajectoryBuffer(cfg=FeatureBufCfg(min_ep_len=1), ctx=ctx, gamma=0.99)
+    loader(buffer)
+    assert len(buffer) == 1

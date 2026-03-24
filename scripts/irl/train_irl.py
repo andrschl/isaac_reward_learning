@@ -14,6 +14,14 @@ import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
+
+# Load .env for WANDB_API_KEY before any wandb imports
+_env_path = Path(__file__).resolve().parents[2] / ".env"
+if _env_path.exists():
+    from dotenv import load_dotenv
+    load_dotenv(_env_path)
+
+from datetime import datetime
 from typing import Any, Callable
 
 import torch
@@ -158,47 +166,12 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _normalize_defaults(defaults_payload: Any) -> dict[str, str]:
-    if defaults_payload is None:
-        return {}
-
-    if isinstance(defaults_payload, dict):
-        return {str(key): str(value) for key, value in defaults_payload.items()}
-
-    if isinstance(defaults_payload, list):
-        defaults_map: dict[str, str] = {}
-        for item in defaults_payload:
-            if not isinstance(item, dict):
-                continue
-            for key, value in item.items():
-                defaults_map[str(key)] = str(value)
-        return defaults_map
-
-    raise TypeError(f"`defaults` must be a mapping or list of mappings, got {type(defaults_payload)!r}.")
-
-
 def _load_train_payload(task_name: str, config_dir: Path) -> dict[str, Any]:
-    base_train_path = config_dir / "train.yaml"
-    if not base_train_path.exists():
-        raise FileNotFoundError(f"Missing base train config: {base_train_path}")
+    experiment_path = config_dir / "experiment.yaml"
+    if not experiment_path.exists():
+        raise FileNotFoundError(f"Missing experiment config: {experiment_path}")
 
-    base_train = _read_yaml(base_train_path)
-
-    task_override_path = config_dir / "train" / f"{_task_slug(task_name)}.yaml"
-    task_override = _read_yaml(task_override_path) if task_override_path.exists() else {}
-
-    merged_train = _deep_merge(base_train, task_override)
-
-    defaults_map = _normalize_defaults(merged_train.get("defaults"))
-    defaults_payload: dict[str, Any] = {}
-    for section_key, rel_path in defaults_map.items():
-        default_path = config_dir / rel_path
-        if not default_path.exists():
-            raise FileNotFoundError(f"Config defaults path for '{section_key}' does not exist: {default_path}")
-        defaults_payload[section_key] = _read_yaml(default_path)
-
-    merged_train.pop("defaults", None)
-    return _deep_merge(defaults_payload, merged_train)
+    return _read_yaml(experiment_path)
 
 
 def _parse_torch_dtype(value: Any, default: torch.dtype) -> torch.dtype:
@@ -279,8 +252,22 @@ def _parse_irl_cfg(section: dict[str, Any]) -> IRLCfg:
     discount_gamma = float(discount_gamma_raw) if discount_gamma_raw is not None else None
     if discount_gamma is not None and not (0.0 < discount_gamma <= 1.0):
         raise ValueError(f"`irl.discount_gamma` must be in (0, 1], got {discount_gamma}.")
+
+    expert_num_trajectories_raw = section.get("expert_num_trajectories")
+    expert_num_trajectories = (
+        int(expert_num_trajectories_raw) if expert_num_trajectories_raw is not None else None
+    )
+    if expert_num_trajectories is not None and expert_num_trajectories <= 0:
+        raise ValueError(
+            f"`irl.expert_num_trajectories` must be > 0 when set, got {expert_num_trajectories}."
+        )
+
     return IRLCfg(
         expert_data_path=str(section.get("expert_data_path", defaults.expert_data_path)),
+        expert_num_trajectories=expert_num_trajectories,
+        expert_subset_strategy=str(
+            section.get("expert_subset_strategy", defaults.expert_subset_strategy)
+        ),
         batch_size=int(section.get("batch_size", defaults.batch_size)),
         num_learning_epochs=int(section.get("num_learning_epochs", defaults.num_learning_epochs)),
         weight_decay=float(section.get("weight_decay", defaults.weight_decay)),
@@ -350,16 +337,33 @@ def _parse_reward_cfg(section: dict[str, Any]) -> RewardModelCfg:
             "Use `hidden_dims` and `is_linear` under `reward:`."
         )
 
-    reward_type = str(section.get("type", "dense_mlp"))
-    if reward_type not in {"dense_mlp", "dense"}:
-        raise ValueError(f"Unsupported reward type '{reward_type}'. Expected 'dense_mlp' or 'dense'.")
+    reward_type = str(section.get("type", "dense"))
+    if reward_type not in {"dense", "linear"}:
+        raise ValueError(
+            f"Unsupported reward type '{reward_type}'. Expected 'dense' or 'linear'."
+        )
 
     defaults = RewardModelCfg(num_features=1)
+    if reward_type == "linear":
+        is_linear = True
+    else:
+        is_linear = bool(section.get("is_linear", defaults.is_linear))
+    linear_projection = str(section.get("linear_projection", defaults.linear_projection))
+    if not is_linear and linear_projection != "none":
+        raise ValueError(
+            "`linear_projection` is only valid when `is_linear` is True. "
+            f"Got is_linear={is_linear}, linear_projection={linear_projection!r}."
+        )
     return RewardModelCfg(
         num_features=int(section.get("num_features", defaults.num_features)),
         hidden_dims=_to_tuple_ints(section.get("hidden_dims"), defaults.hidden_dims),
-        is_linear=bool(section.get("is_linear", defaults.is_linear)),
+        is_linear=is_linear,
         activation=str(section.get("activation", defaults.activation)),
+        regularization=str(section.get("regularization", defaults.regularization)),
+        regularization_strength=float(section.get("regularization_strength", defaults.regularization_strength)),
+        elastic_alpha=float(section.get("elastic_alpha", defaults.elastic_alpha)),
+        linear_projection=linear_projection,
+        linear_projection_radius=float(section.get("linear_projection_radius", defaults.linear_projection_radius)),
     )
 
 
@@ -369,7 +373,7 @@ def load_train_cfg(
     args_cli: argparse.Namespace,
     config_dir: Path | None = None,
 ) -> TrainCfg:
-    config_root = config_dir or (_repo_root() / "configs")
+    config_root = config_dir or (_repo_root() / "configs" / "franka_lift")
     payload = _load_train_payload(task_name=task_name, config_dir=config_root)
 
     env_section = _to_mapping(payload.get("env"), section_name="env")
@@ -407,7 +411,7 @@ def load_train_cfg(
     if int(cfg.max_iterations) <= 0:
         raise ValueError(
             f"`max_iterations` must be > 0, got {int(cfg.max_iterations)}. "
-            "Set a positive value in configs/train.yaml or pass --max_iterations."
+            "Set a positive value in configs/franka_lift/experiment.yaml or pass --max_iterations."
         )
 
     cli_device = getattr(args_cli, "device", None)
@@ -440,6 +444,16 @@ def load_train_cfg(
     expert_data_path = getattr(args_cli, "expert_data_path", None)
     if expert_data_path:
         cfg.irl = replace(cfg.irl, expert_data_path=str(expert_data_path))
+    expert_num_trajectories = getattr(args_cli, "expert_num_trajectories", None)
+    if expert_num_trajectories is not None:
+        if expert_num_trajectories <= 0:
+            raise ValueError(
+                f"`--expert_num_trajectories` must be > 0, got {expert_num_trajectories}."
+            )
+        cfg.irl = replace(cfg.irl, expert_num_trajectories=expert_num_trajectories)
+    expert_subset_strategy = getattr(args_cli, "expert_subset_strategy", None)
+    if expert_subset_strategy is not None:
+        cfg.irl = replace(cfg.irl, expert_subset_strategy=str(expert_subset_strategy))
     irl_discount_gamma = getattr(args_cli, "irl_discount_gamma", None)
     if irl_discount_gamma is not None:
         irl_discount_gamma = float(irl_discount_gamma)
@@ -532,7 +546,7 @@ def _extract_feature_episodes_from_hdf5(path: str) -> list[torch.Tensor]:
                 "Regenerate demos with the simplified recorder."
             )
 
-        feature_names = list(feature_group.keys())
+        feature_names = sorted(feature_group.keys())
         if len(feature_names) == 0:
             raise ValueError(f"Demo '{demo_key}' has empty 'features' group.")
 
@@ -637,10 +651,33 @@ def load_feature_episodes(path: str, expected_feature_dim: int) -> list[torch.Te
     return _validate_feature_episodes(episodes, expected_feature_dim=expected_feature_dim)
 
 
+def _subset_episodes(
+    episodes: list[torch.Tensor],
+    max_num: int,
+    strategy: str,
+    seed: int,
+) -> list[torch.Tensor]:
+    """Return up to max_num episodes. strategy: 'first' | 'random'."""
+    if len(episodes) <= max_num:
+        return episodes
+    if strategy == "first":
+        return episodes[:max_num]
+    if strategy == "random":
+        rng = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(len(episodes), generator=rng)[:max_num].tolist()
+        return [episodes[i] for i in indices]
+    raise ValueError(
+        f"Unknown expert_subset_strategy '{strategy}'. Expected 'first' or 'random'."
+    )
+
+
 def _make_expert_buffer_loader(
     expert_data_path: str,
     *,
     expected_feature_dim: int,
+    max_num_trajectories: int | None = None,
+    subset_strategy: str = "first",
+    seed: int = 42,
 ) -> Callable[[Any], None]:
     resolved_path = os.path.abspath(expert_data_path)
 
@@ -653,6 +690,10 @@ def _make_expert_buffer_loader(
             )
 
         episodes = load_feature_episodes(resolved_path, expected_feature_dim=expected_feature_dim)
+        total = len(episodes)
+        if max_num_trajectories is not None:
+            episodes = _subset_episodes(episodes, max_num_trajectories, subset_strategy, seed)
+            print(f"[INFO] Expert subset: {len(episodes)}/{total} trajectories (strategy={subset_strategy})")
         for episode in episodes:
             buffer.add_episode(episode)
 
@@ -714,6 +755,22 @@ def _try_get_nested_attr(root: Any, attr_path: tuple[str, ...]) -> Any | None:
     return None
 
 
+def _extract_ground_truth_reward_weights(env: Any) -> dict[str, float]:
+    """Extract reward term weights from env's reward_manager (ground truth params)."""
+    try:
+        unwrapped = getattr(env, "unwrapped", env)
+        reward_manager = getattr(unwrapped, "reward_manager", None)
+        if reward_manager is None:
+            return {}
+        term_names = getattr(reward_manager, "_term_names", [])
+        term_cfgs = getattr(reward_manager, "_term_cfgs", [])
+        if len(term_names) != len(term_cfgs):
+            return {}
+        return {str(name): float(getattr(cfg, "weight", 0.0)) for name, cfg in zip(term_names, term_cfgs)}
+    except Exception:
+        return {}
+
+
 def _summarize_env_cfg(env_cfg: Any, train_cfg: TrainCfg) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "cfg_type": f"{type(env_cfg).__module__}.{type(env_cfg).__name__}",
@@ -736,12 +793,23 @@ def _summarize_env_cfg(env_cfg: Any, train_cfg: TrainCfg) -> dict[str, Any]:
     return summary
 
 
-def _dump_run_configs(log_dir: str, env_cfg: Any, train_cfg: TrainCfg) -> None:
+def _dump_run_configs(
+    log_dir: str,
+    env_cfg: Any,
+    train_cfg: TrainCfg,
+    env: Any | None = None,
+) -> None:
     serializable_train_cfg = _to_serializable(train_cfg)
     params_dir = os.path.join(log_dir, "params")
-    _dump_yaml(os.path.join(params_dir, "train.yaml"), serializable_train_cfg)
     env_summary = _summarize_env_cfg(env_cfg, train_cfg)
-    _dump_yaml(os.path.join(params_dir, "env.yaml"), env_summary)
+    experiment_cfg = {**serializable_train_cfg, "env": env_summary}
+    _dump_yaml(os.path.join(params_dir, "experiment.yaml"), experiment_cfg)
+    if env is not None:
+        ground_truth = _extract_ground_truth_reward_weights(env)
+        if ground_truth:
+            _dump_yaml(os.path.join(params_dir, "ground_truth_reward_weights.yaml"), ground_truth)
+            weights_str = "  ".join(f"{k}={v:.4f}" for k, v in ground_truth.items())
+            print(f"[INFO] Ground truth reward weights: {weights_str}")
 
 
 def _rename_video_files_to_iteration_index(video_dir: str, steps_per_iteration: int) -> None:
@@ -840,6 +908,19 @@ def _build_arg_parser(app_launcher_cls: Any) -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to expert feature episodes (.pt/.pth/.h5/.hdf5).",
+    )
+    parser.add_argument(
+        "--expert_num_trajectories",
+        type=int,
+        default=None,
+        help="Max expert trajectories to use (subset for ablations). None = use all.",
+    )
+    parser.add_argument(
+        "--expert_subset_strategy",
+        type=str,
+        choices={"first", "random"},
+        default=None,
+        help="Subset strategy when expert_num_trajectories is set: first | random.",
     )
 
     parser.add_argument("--experiment_name", type=str, default=None, help="Experiment name for logging.")
@@ -954,6 +1035,7 @@ def main(argv: list[str] | None = None, deps: RuntimeDeps | None = None) -> None
             device=train_cfg.device,
             **asdict(train_cfg.rl_algorithm),
         )
+        print(f"[DEBUG] RL algorithm created")
 
         feature_map = _build_feature_map(train_cfg.feature_map, device=train_cfg.device)
         feature_dim = _feature_dim_from_feature_map(feature_map, env)
@@ -962,8 +1044,9 @@ def main(argv: list[str] | None = None, deps: RuntimeDeps | None = None) -> None
             feature_dim=feature_dim,
             device=train_cfg.device,
         )
+        print(f"[DEBUG] Runtime context created")
         reward_model = RewardModel(replace(train_cfg.reward, num_features=runtime_ctx.feature_dim)).to(train_cfg.device)
-
+        print(f"[DEBUG] Reward model created")
         irl_alg = IRL(
             rl_alg=rl_alg,
             reward=reward_model,
@@ -973,14 +1056,17 @@ def main(argv: list[str] | None = None, deps: RuntimeDeps | None = None) -> None
             feature_map=feature_map,
             device=train_cfg.device,
         )
-
+        print(f"[DEBUG] IRL algorithm created")
         expert_loader = None
         if train_cfg.irl.expert_data_path:
             expert_loader = _make_expert_buffer_loader(
                 train_cfg.irl.expert_data_path,
                 expected_feature_dim=runtime_ctx.feature_dim,
+                max_num_trajectories=train_cfg.irl.expert_num_trajectories,
+                subset_strategy=train_cfg.irl.expert_subset_strategy,
+                seed=train_cfg.seed,
             )
-
+        print(f"[DEBUG] Expert loader created")
         runner = IrlRunner(
             env=env,
             rl_alg=rl_alg,
@@ -992,8 +1078,10 @@ def main(argv: list[str] | None = None, deps: RuntimeDeps | None = None) -> None
             device=train_cfg.device,
             expert_buffer_loader=expert_loader,
             reward_env_wrapper_factory=None,
+            logger=train_cfg.logger,
+            wandb_project=train_cfg.wandb_project,
         )
-
+        print(f"[DEBUG] Runner created")
         if train_cfg.resume:
             resume_path = runtime_deps.get_checkpoint_path(
                 log_root_path,
@@ -1001,13 +1089,14 @@ def main(argv: list[str] | None = None, deps: RuntimeDeps | None = None) -> None
                 train_cfg.load_checkpoint,
             )
             runner.load(resume_path, load_optimizer=True)
-
-        _dump_run_configs(log_dir=log_dir, env_cfg=env_cfg, train_cfg=train_cfg)
+        print(f"[DEBUG] Checkpoint loaded")
+        _dump_run_configs(log_dir=log_dir, env_cfg=env_cfg, train_cfg=train_cfg, env=env)
+        print(f"[DEBUG] Run configs dumped")
         runner.learn(
             num_learning_iterations=int(train_cfg.max_iterations),
             init_at_random_ep_len=True,
         )
-
+        print(f"[DEBUG] Learning completed")
     finally:
         if env is not None and hasattr(env, "close"):
             try:

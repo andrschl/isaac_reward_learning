@@ -150,19 +150,24 @@ def _write_yaml(path: Path, payload: dict) -> None:
 def test_train_irl_main_smoke_with_mocked_runtime(tmp_path: Path, monkeypatch):
     module = _load_train_irl_module()
 
-    config_root = tmp_path / "configs"
+    config_root = tmp_path / "configs" / "franka_lift"
+    config_root.mkdir(parents=True, exist_ok=True)
     _write_yaml(
-        config_root / "train.yaml",
+        config_root / "experiment.yaml",
         {
-            "defaults": {
-                "env": "env/isaac_lift_cube_franka.yaml",
-                "reward": "reward/dense_mlp.yaml",
-                "policy": "policy/mlp.yaml",
-                "algo": "algo/ppo.yaml",
-            },
             "experiment_name": "smoke",
             "seed": 1,
             "max_iterations": 1,
+            "env": {"name": "Isaac-Lift-Cube-Franka-v0", "device": "cpu", "num_envs": 1},
+            "reward": {
+                "type": "dense",
+                "hidden_dims": [16],
+                "is_linear": False,
+                "activation": "elu",
+            },
+            "policy": {"actor_hidden_dims": [16], "critic_hidden_dims": [16], "activation": "elu"},
+            "algo": {"learning_rate": 1.0e-4, "gamma": 0.98, "lam": 0.95},
+            "irl": {},
             "runner": {
                 "num_steps_per_env_rl": 1,
                 "save_interval": 10,
@@ -170,23 +175,8 @@ def test_train_irl_main_smoke_with_mocked_runtime(tmp_path: Path, monkeypatch):
                 "reward_updates_per_cycle": 1,
                 "expert_num_envs": 1,
             },
+            "feature_map": {},
         },
-    )
-    _write_yaml(
-        config_root / "env" / "isaac_lift_cube_franka.yaml",
-        {"name": "Isaac-Lift-Cube-Franka-v0", "device": "cpu", "num_envs": 1},
-    )
-    _write_yaml(
-        config_root / "reward" / "dense_mlp.yaml",
-        {"type": "dense_mlp", "hidden_dims": [16], "is_linear": False, "activation": "elu"},
-    )
-    _write_yaml(
-        config_root / "policy" / "mlp.yaml",
-        {"actor_hidden_dims": [16], "critic_hidden_dims": [16], "activation": "elu"},
-    )
-    _write_yaml(
-        config_root / "algo" / "ppo.yaml",
-        {"learning_rate": 1.0e-4, "gamma": 0.98, "lam": 0.95},
     )
 
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)

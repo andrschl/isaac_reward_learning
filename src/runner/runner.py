@@ -11,6 +11,9 @@ from algorithms import IRL
 from utils.runtime_context import RuntimeContext
 from storage.feature_storage import FeatureBufCfg
 
+# Optional wandb; imported lazily when logger == "wandb"
+_wandb_run: Any = None
+
 
 @dataclass(slots=True)
 class IrlRunnerCfg:
@@ -47,6 +50,8 @@ class IrlRunner:
         runtime_ctx: RuntimeContext | None = None,
         expert_buffer_loader: ExpertBufferLoader | None = None,
         reward_env_wrapper_factory: RewardEnvWrapperFactory | None = None,
+        logger: str = "tensorboard",
+        wandb_project: str = "isaaclab",
     ) -> None:
         self.device = torch.device(device)
         self.base_env = env
@@ -56,8 +61,11 @@ class IrlRunner:
         self.feature_map = feature_map
         self.cfg = runner_cfg
         self.log_dir = log_dir
+        self.logger = str(logger)
+        self.wandb_project = str(wandb_project)
         self.writer: TensorboardSummaryWriter | None = None
         self.current_learning_iteration = 0
+        self._last_policy_loss = float("nan")
 
         self.num_steps_per_env_rl = int(runner_cfg.num_steps_per_env_rl)
         self.save_interval = int(runner_cfg.save_interval)
@@ -115,6 +123,16 @@ class IrlRunner:
         os.makedirs(self.log_dir, exist_ok=True)
         self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
 
+    def _ensure_wandb(self) -> None:
+        global _wandb_run
+        if self.logger != "wandb" or _wandb_run is not None:
+            return
+        try:
+            import wandb
+            _wandb_run = wandb.init(project=self.wandb_project, dir=self.log_dir)
+        except Exception:
+            _wandb_run = None
+
     def _collect_imitator_features(self, dones: torch.Tensor) -> None:
         if self.irl_alg.imitator_storage is None:
             return
@@ -139,9 +157,14 @@ class IrlRunner:
             self.rl_alg.compute_returns(obs)
         return obs
 
-    def _run_policy_updates(self) -> None:
+    def _run_policy_updates(self) -> float:
+        policy_loss = float("nan")
         for _ in range(self.policy_updates_per_cycle):
-            self.rl_alg.update()
+            result = self.rl_alg.update()
+            if isinstance(result, dict) and "surrogate" in result:
+                policy_loss = float(result["surrogate"])
+        self._last_policy_loss = policy_loss
+        return policy_loss
 
     def _has_reward_data(self) -> bool:
         expert_storage = self.irl_alg.expert_storage
@@ -157,10 +180,21 @@ class IrlRunner:
             self._last_reward_loss, self._last_reward_grad_norm = self.irl_alg.reward_update()
 
     def _log_iteration(self, iteration: int) -> None:
-        if self.writer is None:
-            return
-        self.writer.add_scalar("IRL/reward_loss", self._last_reward_loss, iteration)
-        self.writer.add_scalar("IRL/reward_grad_norm", self._last_reward_grad_norm, iteration)
+        if self.writer is not None:
+            self.writer.add_scalar("IRL/reward_loss", self._last_reward_loss, iteration)
+            self.writer.add_scalar("IRL/reward_grad_norm", self._last_reward_grad_norm, iteration)
+            self.writer.add_scalar("RL/policy_loss", self._last_policy_loss, iteration)
+        if self.logger == "wandb":
+            self._ensure_wandb()
+            if _wandb_run is not None:
+                _wandb_run.log(
+                    {
+                        "IRL/reward_loss": self._last_reward_loss,
+                        "IRL/reward_grad_norm": self._last_reward_grad_norm,
+                        "RL/policy_loss": self._last_policy_loss,
+                    },
+                    step=iteration,
+                )
 
     def _maybe_save_checkpoint(self, iteration: int) -> None:
         if self.log_dir is None:
@@ -194,6 +228,7 @@ class IrlRunner:
         self.train_mode()
 
         start_iter = self.current_learning_iteration
+        print(f"[INFO] Starting learning for {int(num_learning_iterations)} iterations.")
         for it in range(start_iter, start_iter + int(num_learning_iterations)):
             self.irl_alg.clear_imitator_storage()
             obs = self._collect_rollout_batch(obs)
@@ -201,6 +236,10 @@ class IrlRunner:
             self._run_reward_updates()
             self.current_learning_iteration = it + 1
             self._log_iteration(it)
+            print(
+                f"[INFO] iter {it + 1}  policy_loss={self._last_policy_loss:.4f}  "
+                f"reward_loss={self._last_reward_loss:.4f}  grad_norm={self._last_reward_grad_norm:.4f}"
+            )
             self._maybe_save_checkpoint(it)
 
         if self.log_dir is not None:

@@ -1,0 +1,80 @@
+# Experiment metadata
+experiment_name: franka_lift
+run_name: ""  # Optional suffix for log directory
+logger: tensorboard  # tensorboard | wandb | neptune
+
+seed: 42
+max_iterations: 1500
+
+# Environment (Isaac Lab task)
+env:
+  name: Isaac-Lift-Cube-Franka-v0
+  device: cuda:0
+  num_envs: 4096
+  headless: true
+
+# Feature map: extracts features from env for reward learning
+feature_map:
+  ignored_reward_terms: []  # Reward term names to exclude from features (e.g. ["reach"])
+
+# Learned reward model (dense = MLP, linear = w^T x)
+reward:
+  type: linear  # dense | linear
+  hidden_dims: [256, 128, 64]  # MLP layers (ignored when type: linear)
+  activation: elu
+  is_linear: true
+  # Regularization: none | l2 (typical for dense) | l1 | elastic
+  regularization: l2
+  regularization_strength: 1.0e-4
+  elastic_alpha: 0.5  # L1 fraction when regularization: elastic
+  # Linear-only: projection onto norm ball after optimizer step (none | l1_ball | l2_ball)
+  linear_projection: l2_ball
+  linear_projection_radius: 1.0
+
+# Policy (actor-critic) architecture
+policy:
+  type: mlp
+  actor_hidden_dims: [256, 128, 64]
+  critic_hidden_dims: [256, 128, 64]
+  activation: elu
+
+# PPO algorithm
+algo:
+  type: ppo
+  learning_rate: 1.0e-4
+  gamma: 0.98  # Discount factor
+  lam: 0.95  # GAE lambda
+  num_learning_epochs: 5
+  num_mini_batches: 4
+
+# IRL reward learning
+irl:
+  expert_data_path: ""  # Path to expert demos (.pt or .h5); empty = no expert data
+  expert_num_trajectories: null  # null = use all; int = subset for ablations (e.g. 50)
+  expert_subset_strategy: first  # first | random (random uses experiment seed)
+  batch_size: 256
+  num_learning_epochs: 1
+  weight_decay: 1.0e-6
+  max_grad_norm: 1.0
+  reward_loss_coef: 1.0
+  reward_learning_rate: 1e-4
+  discount_gamma: null  # null = use algo.gamma for IRL returns
+  normalize_returns_by_episode_length: true
+
+# Runner / training loop
+runner:
+  num_steps_per_env_rl: 24  # PPO steps per env per iteration
+  save_interval: 50  # Checkpoint every N iterations
+  policy_updates_per_cycle: 1
+  reward_updates_per_cycle: 1
+  expert_num_envs: 1  # Parallel envs for expert rollout (when expert_data_path set)
+  imitator_buffer:
+    capacity_steps: 1000000
+    store_device: cpu
+    min_ep_len: 2  # Min episode length to store
+    sample_weighted_by_length: true
+  expert_buffer:
+    capacity_steps: 1000000
+    store_device: cpu
+    min_ep_len: 1
+    sample_weighted_by_length: true

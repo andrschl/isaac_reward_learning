@@ -3,10 +3,16 @@ from __future__ import annotations
 import argparse
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
 pytest.importorskip("torch")
+
+# Add project root so scripts package is importable
+_root = Path(__file__).resolve().parents[1]
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 from scripts.rsl_rl import cli_args
 
