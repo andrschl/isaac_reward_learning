@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import importlib.metadata as importlib_metadata
 import os
 import pickle
 import sys
@@ -53,7 +54,7 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -80,6 +81,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+
+    # Migrate legacy `policy=RslRlPpoActorCriticCfg(...)` blocks (used by many
+    # Isaac Lab task configs) into the new-style `actor`/`critic` blocks that
+    # rsl-rl >= 4.0 requires. Without this, `PPO.construct_algorithm` raises
+    # `KeyError: 'class_name'` because the actor/critic factory entries are
+    # missing. Equivalent to what IsaacLab's canonical train.py does.
+    installed_rsl_rl_version = importlib_metadata.version("rsl-rl-lib")
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_rsl_rl_version)
 
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device

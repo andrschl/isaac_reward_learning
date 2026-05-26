@@ -3,28 +3,20 @@ import pytest
 torch = pytest.importorskip("torch")
 nn = pytest.importorskip("torch.nn")
 
-from algorithms.irl import IRL, IRLCfg
+from algorithms.irl import FeatureRewardLearner, IRLCfg
+from reward_model import LinearFeatureRewardModel, RewardModelCfg
 from reward_model.base import BaseRewardModel
 from utils.runtime_context import RuntimeContext
 from storage.feature_storage import FeatureBufCfg, FeatureTrajectoryBuffer
 
 
-class LinearFeatureReward(BaseRewardModel):
+class LinearFeatureReward(LinearFeatureRewardModel):
     def __init__(self, weight: torch.Tensor) -> None:
-        super().__init__()
         if weight.ndim != 1:
             raise ValueError(f"Expected weight shape [D], got {tuple(weight.shape)}")
-        self.linear = nn.Linear(weight.shape[0], 1, bias=False)
+        super().__init__(RewardModelCfg(num_features=weight.shape[0], is_linear=True))
         with torch.no_grad():
-            self.linear.weight.copy_(weight.unsqueeze(0))
-
-    @property
-    def is_linear(self) -> bool:
-        return True
-
-    def get_reward_from_features(self, feats: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        del mask
-        return self.linear(feats)
+            self.reward.weight.copy_(weight.unsqueeze(0))
 
 
 class NonLinearFeatureReward(BaseRewardModel):
@@ -32,10 +24,6 @@ class NonLinearFeatureReward(BaseRewardModel):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(feature_dim))
         self.bias = nn.Parameter(torch.tensor(0.25))
-
-    @property
-    def is_linear(self) -> bool:
-        return False
 
     def get_reward_from_features(self, feats: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         rewards = (feats * self.scale).sum(dim=-1) + self.bias
@@ -68,7 +56,7 @@ def _make_buffer(gamma: float, feature_dim: int = 2) -> FeatureTrajectoryBuffer:
     return FeatureTrajectoryBuffer(cfg=cfg, ctx=ctx, gamma=gamma)
 
 
-def test_eval_discounted_returns_from_model_non_linear_matches_manual_sum():
+def test_discounted_returns_from_features_non_linear_matches_manual_sum():
     gamma = 0.6
     feats = torch.tensor(
         [
@@ -87,17 +75,16 @@ def test_eval_discounted_returns_from_model_non_linear_matches_manual_sum():
     rewards = reward_model.get_reward_from_features(feats, mask)
     expected_returns = _manual_discounted_returns(rewards, mask, gamma)
 
-    returns = FeatureTrajectoryBuffer.eval_discounted_returns_from_model(
+    returns = reward_model.discounted_returns_from_features(
         feats=feats,
         mask=mask,
-        reward_model=reward_model,
         gamma=gamma,
     )
 
     assert torch.allclose(returns, expected_returns)
 
 
-def test_eval_discounted_returns_from_model_linear_matches_discounted_features():
+def test_discounted_returns_from_features_linear_matches_discounted_features():
     gamma = 0.9
     feats = torch.tensor(
         [
@@ -112,17 +99,16 @@ def test_eval_discounted_returns_from_model_linear_matches_discounted_features()
     discounted_feats = FeatureTrajectoryBuffer.discounted_feature_returns(feats, mask, gamma)
     expected_returns = reward_model.get_reward_from_features(discounted_feats).squeeze(-1)
 
-    returns = FeatureTrajectoryBuffer.eval_discounted_returns_from_model(
+    returns = reward_model.discounted_returns_from_features(
         feats=feats,
         mask=mask,
-        reward_model=reward_model,
         gamma=gamma,
     )
 
     assert torch.allclose(returns, expected_returns)
 
 
-def test_eval_discounted_returns_from_model_non_linear_aligns_compute_dtype():
+def test_discounted_returns_from_features_non_linear_aligns_compute_dtype():
     gamma = 0.6
     feats = torch.tensor(
         [
@@ -144,10 +130,9 @@ def test_eval_discounted_returns_from_model_non_linear_aligns_compute_dtype():
     rewards = reward_model.get_reward_from_features(feats_compute, mask_compute)
     expected_returns = _manual_discounted_returns(rewards, mask_compute, gamma)
 
-    returns = FeatureTrajectoryBuffer.eval_discounted_returns_from_model(
+    returns = reward_model.discounted_returns_from_features(
         feats=feats,
         mask=mask,
-        reward_model=reward_model,
         gamma=gamma,
     )
 
@@ -156,7 +141,7 @@ def test_eval_discounted_returns_from_model_non_linear_aligns_compute_dtype():
     assert torch.allclose(returns, expected_returns)
 
 
-def test_eval_discounted_returns_from_model_linear_aligns_compute_dtype():
+def test_discounted_returns_from_features_linear_aligns_compute_dtype():
     gamma = 0.9
     feats = torch.tensor(
         [
@@ -169,46 +154,20 @@ def test_eval_discounted_returns_from_model_linear_aligns_compute_dtype():
 
     reward_model = LinearFeatureReward(weight=torch.tensor([2.0, -1.0], dtype=torch.float32))
     reward_param = next(reward_model.parameters())
-    discounted_feats = FeatureTrajectoryBuffer.discounted_feature_returns(feats, mask, gamma)
-    discounted_feats = discounted_feats.to(device=reward_param.device, dtype=reward_param.dtype)
+    feats_compute = feats.to(device=reward_param.device, dtype=reward_param.dtype)
+    mask_compute = mask.to(device=reward_param.device, dtype=torch.bool)
+    discounted_feats = FeatureTrajectoryBuffer.discounted_feature_returns(feats_compute, mask_compute, gamma)
     expected_returns = reward_model.get_reward_from_features(discounted_feats).squeeze(-1)
 
-    returns = FeatureTrajectoryBuffer.eval_discounted_returns_from_model(
+    returns = reward_model.discounted_returns_from_features(
         feats=feats,
         mask=mask,
-        reward_model=reward_model,
         gamma=gamma,
     )
 
     assert returns.dtype == reward_param.dtype
     assert returns.device == reward_param.device
     assert torch.allclose(returns, expected_returns)
-
-
-@pytest.mark.parametrize("reward_kind", ["linear", "non_linear"])
-def test_sample_and_eval_returns_output_contract(reward_kind: str):
-    gamma = 0.95
-    feature_dim = 2
-    reward_model: BaseRewardModel
-    if reward_kind == "linear":
-        reward_model = LinearFeatureReward(weight=torch.tensor([1.0, 2.0]))
-    else:
-        reward_model = NonLinearFeatureReward(feature_dim=feature_dim)
-
-    buffer = _make_buffer(gamma=gamma, feature_dim=feature_dim)
-    buffer.add_episode(torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32))
-
-    out = buffer.sample_and_eval_returns(reward_model=reward_model, batch_size=1, device="cpu")
-
-    assert set(out.keys()) == {"feats", "mask", "lengths", "returns"}
-    assert out["feats"].shape == (1, 2, feature_dim)
-    assert out["mask"].shape == (1, 2)
-    assert out["lengths"].shape == (1,)
-    assert out["returns"].shape == (1,)
-
-
-class _DummyRlAlg:
-    learning_rate = 1e-3
 
 
 def test_irl_eval_expected_return_matches_shared_helper():
@@ -223,25 +182,26 @@ def test_irl_eval_expected_return_matches_shared_helper():
     mask = torch.tensor([[True, True, False], [True, True, False]])
     reward_model = NonLinearFeatureReward(feature_dim=2)
 
-    irl = IRL(
-        rl_alg=_DummyRlAlg(),
+    irl = FeatureRewardLearner(
         reward=reward_model,
         gamma=gamma,
         cfg=IRLCfg(batch_size=2),
         device="cpu",
     )
 
-    returns = FeatureTrajectoryBuffer.eval_discounted_returns_from_model(
+    returns = reward_model.discounted_returns_from_features(
         feats=feats,
         mask=mask,
-        reward_model=reward_model,
         gamma=gamma,
     )
     lengths = mask.to(dtype=returns.dtype).sum(dim=1).clamp_min(1.0)
-    expected = (returns / lengths).mean()
+    expected_scalar = (returns / lengths).mean()
+    discounted_feats = FeatureTrajectoryBuffer.discounted_feature_returns(feats, mask, gamma)
+    expected_per_feature = (discounted_feats / lengths.unsqueeze(1)).mean(dim=0)
 
-    got = irl._eval_expected_return(feats, mask)
-    assert torch.allclose(got, expected)
+    got_scalar, got_per_feature = irl.eval_expected_return(feats, mask)
+    assert torch.allclose(got_scalar, expected_scalar)
+    assert torch.allclose(got_per_feature, expected_per_feature)
 
 
 def test_irl_eval_expected_return_can_disable_length_normalization():
@@ -256,23 +216,25 @@ def test_irl_eval_expected_return_can_disable_length_normalization():
     mask = torch.tensor([[True, True, False], [True, True, False]])
     reward_model = NonLinearFeatureReward(feature_dim=2)
 
-    irl = IRL(
-        rl_alg=_DummyRlAlg(),
+    irl = FeatureRewardLearner(
         reward=reward_model,
         gamma=gamma,
         cfg=IRLCfg(batch_size=2, normalize_returns_by_episode_length=False),
         device="cpu",
     )
 
-    expected = FeatureTrajectoryBuffer.eval_discounted_returns_from_model(
+    expected_scalar = reward_model.discounted_returns_from_features(
         feats=feats,
         mask=mask,
-        reward_model=reward_model,
         gamma=gamma,
     ).mean()
+    expected_per_feature = FeatureTrajectoryBuffer.discounted_feature_returns(
+        feats, mask, gamma,
+    ).mean(dim=0)
 
-    got = irl._eval_expected_return(feats, mask)
-    assert torch.allclose(got, expected)
+    got_scalar, got_per_feature = irl.eval_expected_return(feats, mask)
+    assert torch.allclose(got_scalar, expected_scalar)
+    assert torch.allclose(got_per_feature, expected_per_feature)
 
 
 def _make_irl_for_discount_cfg(
@@ -280,10 +242,9 @@ def _make_irl_for_discount_cfg(
     gamma: float,
     discount_gamma: float | None,
     normalize_returns_by_episode_length: bool,
-) -> IRL:
+) -> FeatureRewardLearner:
     reward_model = LinearFeatureReward(weight=torch.tensor([1.0, 0.0], dtype=torch.float32))
-    irl = IRL(
-        rl_alg=_DummyRlAlg(),
+    irl = FeatureRewardLearner(
         reward=reward_model,
         gamma=gamma,
         cfg=IRLCfg(
@@ -319,10 +280,10 @@ def test_irl_reward_update_normalizes_returns_by_episode_length_by_default():
         normalize_returns_by_episode_length=True,
     )
 
-    reward_loss, grad_norm = irl.reward_update()
+    metrics = irl.update()
 
-    assert reward_loss == pytest.approx(0.95, abs=1e-5)
-    assert grad_norm > 0.0
+    assert metrics["IRL/reward_loss"] == pytest.approx(0.95, abs=1e-5)
+    assert metrics["IRL/feature_exp_diff_norm"] > 0.0
 
 
 def test_irl_reward_update_uses_separate_discount_gamma_when_configured():
@@ -333,18 +294,40 @@ def test_irl_reward_update_uses_separate_discount_gamma_when_configured():
         normalize_returns_by_episode_length=False,
     )
 
-    reward_loss, grad_norm = irl.reward_update()
+    metrics = irl.update()
 
-    assert reward_loss == pytest.approx(1.5, abs=1e-5)
-    assert grad_norm > 0.0
+    assert metrics["IRL/reward_loss"] == pytest.approx(1.5, abs=1e-5)
+    assert metrics["IRL/feature_exp_diff_norm"] > 0.0
 
 
 def test_irl_rejects_invalid_discount_gamma():
     with pytest.raises(ValueError, match="discount_gamma"):
-        _ = IRL(
-            rl_alg=_DummyRlAlg(),
+        _ = FeatureRewardLearner(
             reward=LinearFeatureReward(weight=torch.tensor([1.0, 0.0], dtype=torch.float32)),
             gamma=0.9,
             cfg=IRLCfg(discount_gamma=0.0),
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize(
+    "cfg, match",
+    [
+        (IRLCfg(expert_num_trajectories=0), "expert_num_trajectories"),
+        (IRLCfg(expert_subset_strategy="middle"), "expert_subset_strategy"),
+        (IRLCfg(batch_size=0), "batch_size"),
+        (IRLCfg(num_learning_epochs=0), "num_learning_epochs"),
+        (IRLCfg(weight_decay=-1.0), "weight_decay"),
+        (IRLCfg(max_grad_norm=0.0), "max_grad_norm"),
+        (IRLCfg(reward_loss_coef=-1.0), "reward_loss_coef"),
+        (IRLCfg(reward_learning_rate=0.0), "reward_learning_rate"),
+    ],
+)
+def test_irl_rejects_invalid_cfg_values(cfg: IRLCfg, match: str):
+    with pytest.raises(ValueError, match=match):
+        _ = FeatureRewardLearner(
+            reward=LinearFeatureReward(weight=torch.tensor([1.0, 0.0], dtype=torch.float32)),
+            gamma=0.9,
+            cfg=cfg,
             device="cpu",
         )

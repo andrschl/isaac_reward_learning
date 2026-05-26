@@ -11,6 +11,11 @@ class ManagerBasedFeatureCfg:
     """Configuration for extracting features from Isaac Lab's reward manager terms."""
 
     ignored_reward_terms: set[str] = field(default_factory=set)
+    force_include_terms: set[str] = field(default_factory=set)
+    """Names of reward-manager terms to extract as features even when their
+    env-reward weight is 0. Use for terms injected purely as IRL features
+    (e.g. ``success_bonus`` with weight=0) that should not also contribute to
+    the env reward signal."""
 
 
 def _as_term_vector(term_value: torch.Tensor, num_envs: int) -> torch.Tensor:
@@ -41,9 +46,14 @@ def manager_based_reward_feature_dict(
     env,
     ignored_reward_terms: Iterable[str] = (),
     device: torch.device | str | None = None,
+    force_include_terms: Iterable[str] = (),
 ) -> dict[str, torch.Tensor]:
     """
     Extract reward-manager term values as a named feature mapping.
+
+    By default skips reward terms with weight=0 (disabled). Terms listed in
+    ``force_include_terms`` are extracted regardless of weight — used for
+    feature-only terms injected with weight=0 (e.g. ``success_bonus``).
 
     Returns:
         feature_values:
@@ -53,11 +63,14 @@ def manager_based_reward_feature_dict(
     unwrapped_env = env.unwrapped
     reward_manager = unwrapped_env.reward_manager
     ignored = set(ignored_reward_terms)
+    forced = set(force_include_terms)
     num_envs = int(unwrapped_env.num_envs)
 
     feature_values: dict[str, torch.Tensor] = {}
     for name, term_cfg in zip(reward_manager._term_names, reward_manager._term_cfgs):
-        if term_cfg.weight == 0.0 or name in ignored:
+        if name in ignored:
+            continue
+        if term_cfg.weight == 0.0 and name not in forced:
             continue
 
         term_params = term_cfg.params or {}
@@ -74,12 +87,14 @@ def manager_based_reward_features(
     env,
     ignored_reward_terms: Iterable[str] = (),
     device: torch.device | str | None = None,
+    force_include_terms: Iterable[str] = (),
 ) -> torch.Tensor:
     """Extract reward-manager term values as a feature matrix [num_envs, num_terms]."""
     named_features = manager_based_reward_feature_dict(
         env=env,
         ignored_reward_terms=ignored_reward_terms,
         device=device,
+        force_include_terms=force_include_terms,
     )
 
     num_envs = int(env.unwrapped.num_envs)
@@ -114,4 +129,5 @@ class ManagerBasedRewardFeatureEncoder:
             env=target,
             ignored_reward_terms=self.cfg.ignored_reward_terms,
             device=self.device,
+            force_include_terms=self.cfg.force_include_terms,
         )

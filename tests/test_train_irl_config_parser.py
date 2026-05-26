@@ -61,10 +61,12 @@ def test_load_train_cfg_loads_from_experiment_yaml():
     assert isinstance(cfg.runner, module.IrlRunnerCfg)
     assert isinstance(cfg.irl, module.IRLCfg)
     assert isinstance(cfg.reward, module.RewardModelCfg)
-    assert cfg.runner.policy_updates_per_cycle == 1
+    assert cfg.runner.rl_updates_per_cycle == 1
     assert cfg.runner.reward_updates_per_cycle == 1
+    assert cfg.runner.validation_interval == 50
+    assert cfg.runner.validation_steps_per_env is None
     assert cfg.irl.discount_gamma is None
-    assert cfg.irl.normalize_returns_by_episode_length is True
+    assert cfg.irl.normalize_returns_by_episode_length is False
 
 
 def test_load_train_cfg_loads_env_from_experiment_yaml(tmp_path: Path):
@@ -114,6 +116,131 @@ def test_load_train_cfg_rejects_stale_runner_key(tmp_path: Path):
     (config_dir / "experiment.yaml").write_text(yaml.safe_dump(train_payload, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(ValueError, match="reward_update_interval"):
+        module.load_train_cfg(
+            task_name="Isaac-Unit-Test-v0",
+            args_cli=_args(task="Isaac-Unit-Test-v0"),
+            config_dir=config_dir,
+        )
+
+
+def test_load_train_cfg_rejects_stale_bc_eval_interval_key(tmp_path: Path):
+    module = _load_train_irl_module()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    train_payload = {
+        "experiment_name": "tmp",
+        "seed": 1,
+        "max_iterations": 10,
+        "env": {"device": "cpu"},
+        "runner": {"bc_eval_interval": 5},
+    }
+    (config_dir / "experiment.yaml").write_text(yaml.safe_dump(train_payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bc_eval_interval"):
+        module.load_train_cfg(
+            task_name="Isaac-Unit-Test-v0",
+            args_cli=_args(task="Isaac-Unit-Test-v0"),
+            config_dir=config_dir,
+        )
+
+
+def test_load_train_cfg_parses_runner_validation_settings(tmp_path: Path):
+    module = _load_train_irl_module()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    train_payload = {
+        "experiment_name": "tmp",
+        "seed": 1,
+        "max_iterations": 10,
+        "env": {"device": "cpu"},
+        "runner": {
+            "validation_interval": 7,
+            "validation_steps_per_env": 40,
+        },
+    }
+    (config_dir / "experiment.yaml").write_text(yaml.safe_dump(train_payload, sort_keys=False), encoding="utf-8")
+
+    cfg = module.load_train_cfg(
+        task_name="Isaac-Unit-Test-v0",
+        args_cli=_args(task="Isaac-Unit-Test-v0"),
+        config_dir=config_dir,
+    )
+    assert cfg.runner.validation_interval == 7
+    assert cfg.runner.validation_steps_per_env == 40
+
+
+def test_load_train_cfg_parses_bc_val_fraction(tmp_path: Path):
+    module = _load_train_irl_module()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    train_payload = {
+        "experiment_name": "tmp",
+        "seed": 1,
+        "max_iterations": 10,
+        "env": {"device": "cpu"},
+        "bc": {"alpha": 0.5, "val_fraction": 0.2},
+    }
+    (config_dir / "experiment.yaml").write_text(yaml.safe_dump(train_payload, sort_keys=False), encoding="utf-8")
+
+    cfg = module.load_train_cfg(
+        task_name="Isaac-Unit-Test-v0",
+        args_cli=_args(task="Isaac-Unit-Test-v0"),
+        config_dir=config_dir,
+    )
+    assert cfg.bc.val_fraction == 0.2
+
+
+def test_load_train_cfg_rejects_invalid_bc_val_fraction(tmp_path: Path):
+    module = _load_train_irl_module()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    train_payload = {
+        "experiment_name": "tmp",
+        "seed": 1,
+        "max_iterations": 10,
+        "env": {"device": "cpu"},
+        "bc": {"alpha": 0.5, "val_fraction": 1.0},
+    }
+    (config_dir / "experiment.yaml").write_text(yaml.safe_dump(train_payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="val_fraction"):
+        module.load_train_cfg(
+            task_name="Isaac-Unit-Test-v0",
+            args_cli=_args(task="Isaac-Unit-Test-v0"),
+            config_dir=config_dir,
+        )
+
+
+@pytest.mark.parametrize(
+    ("runner_payload", "error_match"),
+    [
+        ({"validation_interval": -1}, "validation_interval"),
+        ({"validation_steps_per_env": -1}, "validation_steps_per_env"),
+    ],
+)
+def test_load_train_cfg_rejects_negative_runner_validation_settings(
+    tmp_path: Path,
+    runner_payload: dict,
+    error_match: str,
+):
+    module = _load_train_irl_module()
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    train_payload = {
+        "experiment_name": "tmp",
+        "seed": 1,
+        "max_iterations": 10,
+        "env": {"device": "cpu"},
+        "runner": runner_payload,
+    }
+    (config_dir / "experiment.yaml").write_text(yaml.safe_dump(train_payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error_match):
         module.load_train_cfg(
             task_name="Isaac-Unit-Test-v0",
             args_cli=_args(task="Isaac-Unit-Test-v0"),

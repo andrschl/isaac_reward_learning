@@ -1,7 +1,7 @@
 # Experiment metadata
 experiment_name: franka_lift
 run_name: ""  # Optional suffix for log directory
-logger: tensorboard  # tensorboard | wandb | neptune
+logger: wandb  # wandb | noop
 
 seed: 42
 max_iterations: 1500
@@ -12,6 +12,17 @@ env:
   device: cuda:0
   num_envs: 4096
   headless: true
+  # Object-to-goal distance (m) below which a Lift step counts as success.
+  # Calibrated for the upstream Franka-Lift PPO (object_goal_tracking uses
+  # std=0.3, so the policy typically converges to ~5-10cm residual error;
+  # 0.08m is loose enough to actually register but still meaningful).
+  success_threshold: 0.08
+  # Inject a `success_bonus` reward term (binary `object_reached_goal`) into
+  # the env's RewardsCfg as an IRL FEATURE ONLY (env-reward weight = 0).
+  # The reward model still learns its weight alongside the other features —
+  # set success_bonus_weight > 0 if you also want it to enter the env reward.
+  add_success_bonus: true
+  success_bonus_weight: 0.0
 
 # Feature map: extracts features from env for reward learning
 feature_map:
@@ -49,7 +60,7 @@ algo:
 
 # IRL reward learning
 irl:
-  expert_data_path: ""  # Path to expert demos (.pt or .h5); empty = no expert data
+  expert_data_path: ""  # Required path to expert demos (.pt or .h5); CLI --expert_data_path usually sets this
   expert_num_trajectories: null  # null = use all; int = subset for ablations (e.g. 50)
   expert_subset_strategy: first  # first | random (random uses experiment seed)
   batch_size: 256
@@ -59,22 +70,48 @@ irl:
   reward_loss_coef: 1.0
   reward_learning_rate: 1e-4
   discount_gamma: null  # null = use algo.gamma for IRL returns
-  normalize_returns_by_episode_length: true
-
+  # Off by default now that imitator episodes are collected as full
+  # trajectories (matched to expert demo length) — dividing by the (now nearly
+  # constant) length is a no-op scale factor that just muddies the gradient.
+  # Re-enable only if you collect imitator episodes of meaningfully different
+  # lengths than the expert demos.
+  normalize_returns_by_episode_length: false
 # Runner / training loop
 runner:
-  num_steps_per_env_rl: 24  # PPO steps per env per iteration
+  # If true (recommended), the agent is trained against the learned reward model.
+  # If false, it trains against the env's GT reward and the reward model is fit
+  # alongside as a diagnostic baseline.
+  use_learned_reward: true
+  steps_per_env_per_cycle: 24  # Env steps per env per iteration
   save_interval: 50  # Checkpoint every N iterations
-  policy_updates_per_cycle: 1
+  rl_updates_per_cycle: 1
   reward_updates_per_cycle: 1
   expert_num_envs: 1  # Parallel envs for expert rollout (when expert_data_path set)
+  validation_interval: 50  # Run stochastic + inference validation every N iterations; 0 disables
+  validation_steps_per_env: null  # null = 5 * steps_per_env_per_cycle; 0 disables
+  # Dedicated full-trajectory imitator rollout (filled into the IRL buffer
+  # between reward updates). null = use env.max_episode_length so each env
+  # produces ~1 full episode per IRL cycle, matching expert demo length.
+  imitator_rollout_steps_per_env: null
   imitator_buffer:
     capacity_steps: 1000000
     store_device: cpu
+    store_dtype: float32
     min_ep_len: 2  # Min episode length to store
     sample_weighted_by_length: true
   expert_buffer:
     capacity_steps: 1000000
     store_device: cpu
+    store_dtype: float32
     min_ep_len: 1
     sample_weighted_by_length: true
+
+# Behavioral cloning auxiliary loss
+# When alpha > 0, the policy loss becomes (1-alpha)*L_PPO + alpha*L_BC.
+# Requires irl.expert_data_path to point at an HDF5 with (obs, actions) demos
+# (same file as IRL features). alpha = 1 runs pure offline BC (no env rollouts).
+bc:
+  alpha: 0.0           # 0 = pure PPO+IRL (no BC), 1 = pure BC
+  loss_type: nll       # "nll" | "mse"
+  batch_size: 256
+  val_fraction: 0.1    # >0 holds out that fraction of demo episodes for BC/val_loss

@@ -24,9 +24,8 @@ class _Cfg:
         self.load_run = "old_run"
         self.load_checkpoint = "old.pt"
         self.run_name = "old_name"
-        self.logger = "tensorboard"
+        self.logger = "wandb"
         self.wandb_project = "old_wandb"
-        self.neptune_project = "old_neptune"
 
 
 def _namespace(**overrides) -> argparse.Namespace:
@@ -79,7 +78,7 @@ def test_update_rsl_rl_cfg_overrides_requested_fields():
         load_run="new_run",
         checkpoint="new_model.pt",
         run_name="fresh",
-        logger="neptune",
+        logger="wandb",
         log_project_name="new_project",
     )
 
@@ -90,18 +89,8 @@ def test_update_rsl_rl_cfg_overrides_requested_fields():
     assert cfg.load_run == "new_run"
     assert cfg.load_checkpoint == "new_model.pt"
     assert cfg.run_name == "fresh"
-    assert cfg.logger == "neptune"
+    assert cfg.logger == "wandb"
     assert cfg.wandb_project == "new_project"
-    assert cfg.neptune_project == "new_project"
-
-
-def test_update_rsl_rl_cfg_does_not_change_project_for_tensorboard():
-    cfg = _Cfg()
-    args = _namespace(logger="tensorboard", log_project_name="ignored_project")
-
-    cli_args.update_rsl_rl_cfg(cfg, args)
-    assert cfg.wandb_project == "old_wandb"
-    assert cfg.neptune_project == "old_neptune"
 
 
 def test_parse_rsl_rl_cfg_loads_registry_cfg_and_applies_overrides(monkeypatch):

@@ -101,18 +101,30 @@ class _FakeVecEnvWrapper:
         return getattr(self._env, item)
 
 
-class _FakeActorCritic(nn.Module):
-    def __init__(self, obs, obs_groups, num_actions: int, **kwargs):
+class _FakeMLPModel(nn.Module):
+    """Stand-in for rsl_rl 5.x MLPModel."""
+
+    def __init__(self, obs, obs_groups, obs_set, output_dim, **kwargs):
         super().__init__()
-        del obs, obs_groups, num_actions, kwargs
+        del obs, obs_groups, obs_set, output_dim, kwargs
         self.linear = nn.Linear(1, 1)
 
 
+class _FakeRolloutStorage:
+    def __init__(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape, device="cpu"):
+        del training_type, num_envs, num_transitions_per_env, obs, actions_shape, device
+
+
 class _FakePPO:
-    def __init__(self, policy: nn.Module, device: str, **kwargs):
-        del device, kwargs
-        self.policy = policy
-        self.optimizer = torch.optim.SGD(policy.parameters(), lr=1e-2)
+    def __init__(self, *, actor: nn.Module, critic: nn.Module, storage, device: str, **kwargs):
+        del storage, device, kwargs
+        self.actor = actor
+        self.critic = critic
+        # Single optimizer over the union of params so existing checkpoint-style
+        # `optimizer` access keeps working.
+        self.optimizer = torch.optim.SGD(
+            list(actor.parameters()) + list(critic.parameters()), lr=1e-2
+        )
 
 
 class _FakeRewardModel(nn.Module):
@@ -122,10 +134,14 @@ class _FakeRewardModel(nn.Module):
         self.linear = nn.Linear(1, 1)
 
 
-class _FakeIRL:
+class _FakeIrlAlg:
     def __init__(self, **kwargs) -> None:
         self.reward = kwargs["reward"]
         self.reward_optimizer = torch.optim.SGD(self.reward.parameters(), lr=1e-2)
+        self.expert_storage = None
+
+    def add_expert_episode(self, features) -> None:
+        del features
 
 
 class _FakeRunner:
@@ -140,6 +156,9 @@ class _FakeRunner:
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         del num_learning_iterations, init_at_random_ep_len
         _FakeRunner.learn_calls += 1
+
+    def finish_logger(self, exit_code: int = 0) -> None:
+        del exit_code
 
 
 def _write_yaml(path: Path, payload: dict) -> None:
@@ -167,11 +186,11 @@ def test_train_irl_main_smoke_with_mocked_runtime(tmp_path: Path, monkeypatch):
             },
             "policy": {"actor_hidden_dims": [16], "critic_hidden_dims": [16], "activation": "elu"},
             "algo": {"learning_rate": 1.0e-4, "gamma": 0.98, "lam": 0.95},
-            "irl": {},
+            "irl": {"expert_data_path": "expert.pt"},
             "runner": {
-                "num_steps_per_env_rl": 1,
+                "steps_per_env_per_cycle": 1,
                 "save_interval": 10,
-                "policy_updates_per_cycle": 1,
+                "rl_updates_per_cycle": 1,
                 "reward_updates_per_cycle": 1,
                 "expert_num_envs": 1,
             },
@@ -182,9 +201,15 @@ def test_train_irl_main_smoke_with_mocked_runtime(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
     monkeypatch.setattr(module, "_build_feature_map", lambda cfg, device: (lambda env: torch.zeros(env.num_envs, 2)))
     monkeypatch.setattr(module, "_feature_dim_from_feature_map", lambda feature_map, env: 2)
-    monkeypatch.setattr(module, "RewardModel", _FakeRewardModel)
-    monkeypatch.setattr(module, "IRL", _FakeIRL)
+    monkeypatch.setattr(
+        module, "manager_based_reward_feature_dict",
+        lambda env, ignored_reward_terms, device, force_include_terms=(): {"feat_a": None, "feat_b": None},
+    )
+    monkeypatch.setattr(module, "DenseFeatureRewardModel", _FakeRewardModel)
+    monkeypatch.setattr(module, "LinearFeatureRewardModel", _FakeRewardModel)
+    monkeypatch.setattr(module, "FeatureRewardLearner", _FakeIrlAlg)
     monkeypatch.setattr(module, "IrlRunner", _FakeRunner)
+    monkeypatch.setattr(module, "_install_expert_episodes", lambda *args, **kwargs: None)
 
     fake_deps = module.RuntimeDeps(
         AppLauncher=_FakeAppLauncher,
@@ -193,7 +218,8 @@ def test_train_irl_main_smoke_with_mocked_runtime(tmp_path: Path, monkeypatch):
         get_checkpoint_path=lambda *args, **kwargs: "unused.pt",
         RslRlVecEnvWrapper=_FakeVecEnvWrapper,
         PPO=_FakePPO,
-        ActorCritic=_FakeActorCritic,
+        MLPModel=_FakeMLPModel,
+        RolloutStorage=_FakeRolloutStorage,
         resolve_obs_groups=lambda obs, groups, default_sets=None: {"critic": []},
     )
 
@@ -234,7 +260,8 @@ def test_main_loads_runtime_deps_after_sim_app_init(monkeypatch):
             get_checkpoint_path=lambda *args, **kwargs: "unused.pt",
             RslRlVecEnvWrapper=_FakeVecEnvWrapper,
             PPO=_FakePPO,
-            ActorCritic=_FakeActorCritic,
+            MLPModel=_FakeMLPModel,
+            RolloutStorage=_FakeRolloutStorage,
             resolve_obs_groups=lambda obs, groups, default_sets=None: {"critic": []},
         )
 

@@ -102,6 +102,7 @@ instead of deep inheritance trees.
 ---
 
 ## Validation and Error Messages
+- No try/except unless an error is genuinely expected
 - Validate shapes/devices/dtypes at API boundaries.
 - Raise actionable errors that include:
   - expected shape/value

@@ -18,7 +18,7 @@ import cli_args as cli_args  # isort: skip
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect synthetic demos with an RSL-RL policy.")
-    parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
+    parser.add_argument("--num_envs", type=int, default=1000, help="Number of environments to simulate.")
     parser.add_argument("--task", type=str, default=None, help="Task name.")
     parser.add_argument("--num_demos", type=int, default=1000, help="Number of episodes to collect.")
     parser.add_argument(
@@ -27,14 +27,45 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum episode length override. Defaults to the env max episode length.",
     )
-    parser.add_argument("--video", action="store_true", default=False, help="Record videos during collection.")
+    parser.add_argument(
+        "--video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record one short clip of the collection rollout. Disable with --no-video.",
+    )
     parser.add_argument(
         "--video_length",
         type=int,
-        default=None,
-        help="Recorded clip length in steps. Defaults to the effective demo length.",
+        default=250,
+        help="Recorded clip length in steps. Defaults to 250 (~5 s at 50 Hz), matching the "
+        "training-side final-video default.",
     )
     parser.add_argument("--feature_key", type=str, default="features", help="Dataset key used for features.")
+    parser.add_argument(
+        "--success_threshold",
+        type=float,
+        default=0.08,
+        help="Object-to-goal distance (m) below which a step counts as success. Recorded per step "
+        "(lift task only) so the IRL trainer can report an expert success rate. "
+        "Default matches `env.success_threshold` in configs/franka_lift/experiment.yaml (0.08).",
+    )
+    parser.add_argument(
+        "--add_success_bonus",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Inject a `success_bonus` reward term (binary object_reached_goal) "
+        "into the env's RewardsCfg before gym.make, exposed as an IRL feature. "
+        "Env-reward contribution is controlled by --success_bonus_weight (default 0). "
+        "Disable with --no-add_success_bonus.",
+    )
+    parser.add_argument(
+        "--success_bonus_weight",
+        type=float,
+        default=0.0,
+        help="Weight of the injected success-bonus term in the env reward signal. "
+        "Defaults to 0.0 so the term is feature-only (recorded as a feature column "
+        "in demos.hdf5 without inflating env rewards).",
+    )
     parser.add_argument(
         "--feature_type",
         type=str,
@@ -82,18 +113,22 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 from rsl_rl.runners import OnPolicyRunner
 
+import importlib.metadata as _importlib_metadata
+
 from isaaclab.utils.dict import print_dict
-from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 
 try:
     from collectors import RobomimicDataCollector
     from reward_features.manager_based import manager_based_reward_feature_dict
+    from reward_features.success_bonus import add_success_bonus_term
 except ModuleNotFoundError:
     repo_src = Path(__file__).resolve().parents[2] / "src"
     sys.path.insert(0, str(repo_src))
     from collectors import RobomimicDataCollector
     from reward_features.manager_based import manager_based_reward_feature_dict
+    from reward_features.success_bonus import add_success_bonus_term
 
 
 def _is_mapping_like(value: Any) -> bool:
@@ -172,6 +207,24 @@ def _step_env(env: Any, actions: torch.Tensor) -> tuple[Any, torch.Tensor, torch
     return obs, rewards_tensor, dones_tensor.to(torch.bool)
 
 
+def _build_success_fn(task_name: str, threshold: float) -> Any:
+    """Return ``success_fn(env) -> [N] bool`` from the Lift task's
+    ``object_reached_goal``, or None for tasks that don't provide it.
+
+    Best-effort: recording must never break if success can't be computed.
+    """
+    try:
+        from isaaclab_tasks.manager_based.manipulation.lift.mdp import object_reached_goal
+    except Exception as exc:
+        print(f"[WARN] No success metric for task {task_name!r} (object_reached_goal unavailable): {exc}")
+        return None
+
+    def success_fn(env: Any) -> torch.Tensor:
+        return object_reached_goal(env.unwrapped, threshold=threshold)
+
+    return success_fn
+
+
 def _get_policy_observations(env: Any) -> Any:
     """Return current policy observations from the vectorized env wrapper."""
     if hasattr(env, "get_observations"):
@@ -192,7 +245,26 @@ def main() -> None:
         )
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+
+    if args_cli.add_success_bonus:
+        added = add_success_bonus_term(
+            env_cfg,
+            threshold=float(args_cli.success_threshold),
+            weight=float(args_cli.success_bonus_weight),
+        )
+        if added:
+            print(
+                f"[INFO] Injected `success_bonus` reward term "
+                f"(weight={args_cli.success_bonus_weight}, threshold={args_cli.success_threshold} m)."
+            )
+        else:
+            print("[WARN] --add_success_bonus set but env_cfg has no `rewards` section; skipped.")
+
     agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    # Migrate legacy `policy=RslRlPpoActorCriticCfg(...)` to the new-style
+    # `actor`/`critic` blocks required by rsl-rl >= 4.0. Without this,
+    # `PPO.construct_algorithm` raises `KeyError: 'class_name'`.
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _importlib_metadata.version("rsl-rl-lib"))
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     max_demo_length = _resolve_demo_length(env, args_cli.demo_length)
@@ -239,6 +311,11 @@ def main() -> None:
     collector.reset()
 
     ignored_terms = {term.strip() for term in args_cli.ignored_reward_terms.split(",") if term.strip()}
+    forced_feature_terms: set[str] = {"success_bonus"} if args_cli.add_success_bonus else set()
+
+    success_fn = _build_success_fn(args_cli.task, float(args_cli.success_threshold))
+    if success_fn is not None:
+        print(f"[INFO] Recording per-step success (object within {args_cli.success_threshold} m of goal).")
 
     policy_obs = _get_policy_observations(env)
     obs_map = _as_obs_mapping(policy_obs)
@@ -252,17 +329,21 @@ def main() -> None:
             while not collector.is_stopped():
                 collector.add("obs", obs_map)
 
-                named_features = manager_based_reward_feature_dict(
-                    env=env,
-                    ignored_reward_terms=ignored_terms,
-                    device=env.unwrapped.device,
-                )
-                collector.add(args_cli.feature_key, named_features)
-
                 actions = policy(policy_obs)
                 collector.add("actions", actions)
 
                 policy_obs, rewards, dones = _step_env(env, actions)
+
+                # Features are post-step so expert demos match the learned-reward
+                # wrapper and training-side imitator storage semantics.
+                named_features = manager_based_reward_feature_dict(
+                    env=env,
+                    ignored_reward_terms=ignored_terms,
+                    device=env.unwrapped.device,
+                    force_include_terms=forced_feature_terms,
+                )
+                collector.add(args_cli.feature_key, named_features)
+
                 obs_map = _as_obs_mapping(policy_obs)
                 env_dones = dones.reshape(-1).to(torch.bool)
                 episode_steps += 1
@@ -270,6 +351,9 @@ def main() -> None:
                 effective_dones = env_dones | timeout_dones
                 collector.add("rewards", rewards)
                 collector.add("dones", effective_dones)
+                if success_fn is not None:
+                    step_success = success_fn(env).reshape(-1).to(torch.float32)
+                    collector.add("success", step_success)
 
                 done_env_ids = effective_dones.nonzero(as_tuple=False).squeeze(-1)
                 collector.flush(done_env_ids)

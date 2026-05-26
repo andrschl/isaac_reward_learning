@@ -24,14 +24,14 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser) -> None:
         "--logger",
         type=str,
         default=None,
-        choices={"wandb", "tensorboard", "neptune"},
+        choices={"wandb"},
         help="Logger module to use.",
     )
     arg_group.add_argument(
         "--log_project_name",
         type=str,
         default=None,
-        help="Project name when using wandb or neptune.",
+        help="Project name when using wandb.",
     )
 
 
@@ -49,9 +49,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.run_name = args_cli.run_name
     if args_cli.logger is not None:
         agent_cfg.logger = args_cli.logger
-    if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
+    if agent_cfg.logger == "wandb" and args_cli.log_project_name:
         agent_cfg.wandb_project = args_cli.log_project_name
-        agent_cfg.neptune_project = args_cli.log_project_name
     return agent_cfg
 
 

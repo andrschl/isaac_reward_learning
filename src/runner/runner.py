@@ -1,115 +1,138 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import torch
-from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
-from algorithms import IRL
+from interfaces import EnvTransition, FeatureStep, PolicyMode, RlAlgorithm, IrlAlgorithm
+from runner.console_reporter import ConsoleReporter
+from runner.loggers import MetricLogger, NoopMetricLogger
+from storage.feature_storage import FeatureBufCfg, FeatureTrajectoryBuffer
 from utils.runtime_context import RuntimeContext
-from storage.feature_storage import FeatureBufCfg
-
-# Optional wandb; imported lazily when logger == "wandb"
-_wandb_run: Any = None
 
 
 @dataclass(slots=True)
 class IrlRunnerCfg:
     """Runner/trainer-only config."""
 
-    num_steps_per_env_rl: int = 24
+    steps_per_env_per_cycle: int = 24
     save_interval: int = 50
 
-    policy_updates_per_cycle: int = 1
+    rl_updates_per_cycle: int = 1
     reward_updates_per_cycle: int = 1
+    use_learned_reward: bool = True
 
     imitator_buffer: FeatureBufCfg = field(default_factory=FeatureBufCfg)
     expert_buffer: FeatureBufCfg = field(default_factory=lambda: FeatureBufCfg(min_ep_len=1))
     expert_num_envs: int = 1
 
+    # Length of the dedicated full-trajectory imitator rollout used to refresh
+    # the reward-learner imitator buffer between reward updates. None resolves
+    # to ``env.max_episode_length`` at runtime so each env produces ~1 full
+    # episode per cycle (matching expert demo length).
+    imitator_rollout_steps_per_env: int | None = None
 
-ExpertBufferLoader = Callable[[Any], None]
-RewardEnvWrapperFactory = Callable[[Any, torch.nn.Module, Callable[[Any], torch.Tensor]], Any]
+    # Run validation rollouts every this many learning iterations. 0 disables.
+    validation_interval: int = 50
+    # Number of validation env steps per policy mode. None = 5x training rollout.
+    # 0 disables validation.
+    validation_steps_per_env: int | None = None
+
+
+Observation = Any
+FeatureSink = Callable[[FeatureStep], None]
+StepCallback = Callable[[], None]
 
 
 class IrlRunner:
-    """On-policy PPO + feature-buffer IRL runner."""
+    """Algorithm-agnostic runner for policy + feature-buffer reward learning."""
 
     def __init__(
         self,
         env,
         *,
-        rl_alg,
-        irl_alg: IRL,
+        rl_alg: RlAlgorithm,
+        irl_alg: IrlAlgorithm,
         feature_map: Callable[[Any], torch.Tensor],
         runner_cfg: IrlRunnerCfg,
+        success_fn: Callable[[Any], torch.Tensor] | None = None,
         log_dir: str | None = None,
         device: str | torch.device = "cpu",
         runtime_ctx: RuntimeContext | None = None,
-        expert_buffer_loader: ExpertBufferLoader | None = None,
-        reward_env_wrapper_factory: RewardEnvWrapperFactory | None = None,
-        logger: str = "tensorboard",
-        wandb_project: str = "isaaclab",
+        metric_logger: MetricLogger | None = None,
+        console_reporter: ConsoleReporter | None = None,
     ) -> None:
         self.device = torch.device(device)
-        self.base_env = env
         self.env = env
         self.rl_alg = rl_alg
         self.irl_alg = irl_alg
         self.feature_map = feature_map
+        self.success_fn = success_fn
         self.cfg = runner_cfg
         self.log_dir = log_dir
-        self.logger = str(logger)
-        self.wandb_project = str(wandb_project)
-        self.writer: TensorboardSummaryWriter | None = None
+        self.metric_logger = metric_logger or NoopMetricLogger()
+        self.console_reporter = console_reporter or ConsoleReporter()
+
         self.current_learning_iteration = 0
-        self._last_policy_loss = float("nan")
+        self.global_timestep = 0
+        self._last_rl_metrics: dict[str, float] = {"RL/policy_loss": float("nan")}
+        self._last_reward_metrics: dict[str, float] = {
+            "IRL/reward_loss": float("nan"),
+            "IRL/feature_exp_diff_norm": float("nan"),
+        }
 
-        self.num_steps_per_env_rl = int(runner_cfg.num_steps_per_env_rl)
-        self.save_interval = int(runner_cfg.save_interval)
-        self.policy_updates_per_cycle = int(runner_cfg.policy_updates_per_cycle)
-        self.reward_updates_per_cycle = int(runner_cfg.reward_updates_per_cycle)
-        self.expert_num_envs = int(runner_cfg.expert_num_envs)
-        self.imitator_buffer_cfg = runner_cfg.imitator_buffer
-        self.expert_buffer_cfg = runner_cfg.expert_buffer
-
-        # Optional learned-reward wrapper
-        if reward_env_wrapper_factory is not None:
-            self.env = reward_env_wrapper_factory(self.base_env, self.irl_alg.reward, self.feature_map)
-            self.irl_alg.env = self.env
-        else:
-            self.irl_alg.env = self.base_env
-
-        obs0 = self._get_obs().to(self.device)
-        self.rl_alg.init_storage(
-            "rl",
-            self.env.num_envs,
-            self.num_steps_per_env_rl,
-            obs0,
-            [self.env.num_actions],
-        )
+        self._validate_cfg()
 
         if runtime_ctx is None:
+            probe_features = self._as_feature_tensor(self.feature_map(self.env))
+            if probe_features.ndim != 2:
+                raise ValueError(f"Feature map must return shape [N, D], got {tuple(probe_features.shape)}.")
             runtime_ctx = RuntimeContext(
                 num_envs=int(self.env.num_envs),
-                feature_dim=int(self.feature_map(self.env).shape[1]),
+                feature_dim=int(probe_features.shape[1]),
                 device=str(self.device),
             )
+        self._runtime_ctx = runtime_ctx
 
-        self.irl_alg.init_imitator_storage(runtime_ctx=runtime_ctx, cfg=self.imitator_buffer_cfg)
+        feature_names = self.irl_alg.feature_names
+        if feature_names is not None and len(feature_names) != int(runtime_ctx.feature_dim):
+            raise ValueError(
+                f"irl_alg.feature_names length ({len(feature_names)}) must equal "
+                f"runtime_ctx.feature_dim ({int(runtime_ctx.feature_dim)})."
+            )
+
+        self.irl_alg.init_imitator_storage(runtime_ctx=runtime_ctx, cfg=self.cfg.imitator_buffer)
         self.irl_alg.init_expert_storage(
             runtime_ctx=runtime_ctx,
-            cfg=self.expert_buffer_cfg,
-            num_envs=self.expert_num_envs,
+            cfg=self.cfg.expert_buffer,
+            num_envs=int(self.cfg.expert_num_envs),
         )
 
-        if expert_buffer_loader is not None:
-            expert_buffer_loader(self.irl_alg.expert_storage)
-
-        self._last_reward_loss = float("nan")
-        self._last_reward_grad_norm = float("nan")
+    def _validate_cfg(self) -> None:
+        cfg = self.cfg
+        if cfg.steps_per_env_per_cycle <= 0:
+            raise ValueError(f"`steps_per_env_per_cycle` must be > 0, got {cfg.steps_per_env_per_cycle}.")
+        if cfg.save_interval <= 0:
+            raise ValueError(f"`save_interval` must be > 0, got {cfg.save_interval}.")
+        if cfg.rl_updates_per_cycle <= 0:
+            raise ValueError(f"`rl_updates_per_cycle` must be > 0, got {cfg.rl_updates_per_cycle}.")
+        if cfg.reward_updates_per_cycle <= 0:
+            raise ValueError(f"`reward_updates_per_cycle` must be > 0, got {cfg.reward_updates_per_cycle}.")
+        if cfg.expert_num_envs <= 0:
+            raise ValueError(f"`expert_num_envs` must be > 0, got {cfg.expert_num_envs}.")
+        if cfg.imitator_rollout_steps_per_env is not None and int(cfg.imitator_rollout_steps_per_env) <= 0:
+            raise ValueError(
+                "`imitator_rollout_steps_per_env` must be > 0 or None, "
+                f"got {cfg.imitator_rollout_steps_per_env}."
+            )
+        if cfg.validation_interval < 0:
+            raise ValueError(f"`validation_interval` must be >= 0, got {cfg.validation_interval}.")
+        if cfg.validation_steps_per_env is not None and int(cfg.validation_steps_per_env) < 0:
+            raise ValueError(
+                f"`validation_steps_per_env` must be >= 0 or None, got {cfg.validation_steps_per_env}."
+            )
 
     def _get_obs(self):
         obs = self.env.get_observations()
@@ -117,129 +140,458 @@ class IrlRunner:
             return obs[0]
         return obs
 
-    def _ensure_writer(self) -> None:
-        if self.log_dir is None or self.writer is not None:
-            return
-        os.makedirs(self.log_dir, exist_ok=True)
-        self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
-
-    def _ensure_wandb(self) -> None:
-        global _wandb_run
-        if self.logger != "wandb" or _wandb_run is not None:
-            return
-        try:
-            import wandb
-            _wandb_run = wandb.init(project=self.wandb_project, dir=self.log_dir)
-        except Exception:
-            _wandb_run = None
-
-    def _collect_imitator_features(self, dones: torch.Tensor) -> None:
-        if self.irl_alg.imitator_storage is None:
-            return
-        features = self.feature_map(self.env)
-        if not isinstance(features, torch.Tensor):
-            features = torch.as_tensor(features)
-        self.irl_alg.process_env_step(dones=dones, features=features.to(self.device))
-
-    def _collect_rollout_batch(self, obs: torch.Tensor) -> torch.Tensor:
-        with torch.inference_mode():
-            for _ in range(self.num_steps_per_env_rl):
-                actions = self.rl_alg.act(obs)
-                obs_next, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                obs_next = obs_next.to(self.device)
-                rewards = rewards.to(self.device)
-                dones = dones.to(self.device)
-
-                self.rl_alg.process_env_step(obs_next, rewards, dones, extras)
-                self._collect_imitator_features(dones=dones.to(torch.bool))
-                obs = obs_next
-
-            self.rl_alg.compute_returns(obs)
+    def _obs_to_device(self, obs: Observation) -> Observation:
+        """Move tensor leaves or TensorDict-like observations to the runner device."""
+        if isinstance(obs, torch.Tensor):
+            return obs.to(self.device)
+        to_device = getattr(obs, "to", None)
+        if callable(to_device):
+            return to_device(self.device)
+        if isinstance(obs, dict):
+            return {key: self._obs_to_device(value) for key, value in obs.items()}
+        if isinstance(obs, tuple):
+            return tuple(self._obs_to_device(value) for value in obs)
+        if isinstance(obs, list):
+            return [self._obs_to_device(value) for value in obs]
         return obs
 
-    def _run_policy_updates(self) -> float:
-        policy_loss = float("nan")
-        for _ in range(self.policy_updates_per_cycle):
-            result = self.rl_alg.update()
-            if isinstance(result, dict) and "surrogate" in result:
-                policy_loss = float(result["surrogate"])
-        self._last_policy_loss = policy_loss
-        return policy_loss
+    def _as_feature_tensor(self, features: Any) -> torch.Tensor:
+        if not isinstance(features, torch.Tensor):
+            features = torch.as_tensor(features)
+        return features.to(self.device)
 
-    def _has_reward_data(self) -> bool:
-        expert_storage = self.irl_alg.expert_storage
-        imitator_storage = self.irl_alg.imitator_storage
-        if expert_storage is None or imitator_storage is None:
-            return False
-        return len(expert_storage) > 0 and len(imitator_storage) > 0
+    def _step_features(self) -> torch.Tensor:
+        features = self._as_feature_tensor(self.feature_map(self.env))
+        if features.ndim != 2:
+            raise ValueError(f"Expected feature_map(env) shape [N, D], got {tuple(features.shape)}.")
+        expected_shape = (int(self._runtime_ctx.num_envs), int(self._runtime_ctx.feature_dim))
+        if tuple(features.shape) != expected_shape:
+            raise ValueError(
+                f"Expected feature_map(env) shape {expected_shape}, got {tuple(features.shape)}."
+            )
+        return features
+
+    def _rl_rewards(self, env_rewards: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        if not self.cfg.use_learned_reward:
+            return env_rewards
+        with torch.no_grad():
+            learned_rewards = self.irl_alg.reward_model(features)
+        learned_rewards = self._ensure_per_env_rewards(learned_rewards, num_envs=int(env_rewards.shape[0]))
+        return learned_rewards.detach().to(device=env_rewards.device, dtype=env_rewards.dtype)
+
+    @staticmethod
+    def _ensure_per_env_rewards(rewards: torch.Tensor, *, num_envs: int) -> torch.Tensor:
+        if not isinstance(rewards, torch.Tensor):
+            rewards = torch.as_tensor(rewards)
+        if rewards.ndim == 2 and rewards.shape[-1] == 1:
+            rewards = rewards.squeeze(-1)
+        if rewards.ndim != 1 or rewards.shape[0] != num_envs:
+            raise ValueError(
+                f"Expected learned reward shape [{num_envs}], got {tuple(rewards.shape)}. "
+                "Reward model must produce one scalar reward per env."
+            )
+        return rewards
+
+    def _rollout(
+        self,
+        obs: Any,
+        *,
+        num_steps_per_env: int,
+        action_fn: Callable[[Any], torch.Tensor],
+        observe_rl: bool,
+        feature_sink: FeatureSink | None = None,
+        on_step: StepCallback | None = None,
+    ) -> Any:
+        """Roll out the environment for a fixed vectorized horizon.
+
+        Shapes:
+            actions:      [N, A]
+            rewards:      [N]
+            dones:        [N]
+            features:     [N, D] when extracted
+        """
+        with torch.inference_mode():
+            for _ in range(num_steps_per_env):
+                obs_before = obs
+                actions = action_fn(obs_before)
+                obs_next, env_rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                obs_next = self._obs_to_device(obs_next)
+                env_rewards = env_rewards.to(self.device)
+                done_vec = self._as_done_vector(dones)
+
+                features: torch.Tensor | None = None
+                if (observe_rl and self.cfg.use_learned_reward) or feature_sink is not None:
+                    features = self._step_features()
+
+                if observe_rl:
+                    rewards = env_rewards if features is None else self._rl_rewards(env_rewards, features)
+                    self.rl_alg.observe(
+                        EnvTransition(
+                            obs=obs_before,
+                            actions=actions.to(self.device),
+                            env_rewards=env_rewards,
+                            rewards=rewards,
+                            dones=done_vec,
+                            next_obs=obs_next,
+                            extras=extras,
+                        )
+                    )
+
+                if feature_sink is not None:
+                    if features is None:
+                        features = self._step_features()
+                    feature_sink(FeatureStep(features=features, dones=done_vec))
+
+                if on_step is not None:
+                    on_step()
+
+                obs = obs_next
+                self.global_timestep += int(self._runtime_ctx.num_envs)
+        return obs
+
+    def _as_done_vector(self, dones: torch.Tensor) -> torch.Tensor:
+        """Normalize environment dones to a boolean vector [N] on runner device."""
+        if not isinstance(dones, torch.Tensor):
+            dones = torch.as_tensor(dones)
+        done_vec = dones.to(device=self.device).reshape(-1).to(torch.bool)
+        expected_shape = (int(self._runtime_ctx.num_envs),)
+        if tuple(done_vec.shape) != expected_shape:
+            raise ValueError(f"Expected dones shape {expected_shape}, got {tuple(dones.shape)}.")
+        return done_vec
+
+    def _collect_rl_rollout(self, obs: Any) -> Any:
+        obs = self._rollout(
+            obs,
+            num_steps_per_env=int(self.cfg.steps_per_env_per_cycle),
+            action_fn=self.rl_alg.collect_action,
+            observe_rl=True,
+        )
+        self.rl_alg.end_rollout(obs)
+        return obs
+
+    def _resolved_imitator_rollout_steps(self) -> int:
+        if self.cfg.imitator_rollout_steps_per_env is not None:
+            return int(self.cfg.imitator_rollout_steps_per_env)
+        max_ep = getattr(self.env, "max_episode_length", None)
+        if max_ep is None:
+            raise ValueError(
+                "Could not infer imitator rollout length: env has no "
+                "`max_episode_length`. Set `runner.imitator_rollout_steps_per_env` "
+                "explicitly."
+            )
+        max_ep_int = int(max_ep)
+        if max_ep_int <= 0:
+            raise ValueError(
+                f"env.max_episode_length must be > 0, got {max_ep_int}. "
+                "Set `runner.imitator_rollout_steps_per_env` explicitly."
+            )
+        return max_ep_int
+
+    def _collect_imitator_trajectories(self, obs: Any) -> Any:
+        """Refresh reward-learner imitator data from a fresh policy rollout."""
+        self.irl_alg.clear_imitator()
+        obs = self._rollout(
+            obs,
+            num_steps_per_env=self._resolved_imitator_rollout_steps(),
+            action_fn=lambda o: self.rl_alg.act(o, mode=PolicyMode.TRAIN),
+            observe_rl=False,
+            feature_sink=self.irl_alg.observe,
+        )
+        self.irl_alg.finalize_imitator()
+        return obs
+
+    def _run_rl_updates(self, obs: Any) -> Any:
+        metrics: dict[str, float] = {}
+        if self.rl_alg.collects_rollouts:
+            obs = self._collect_rl_rollout(obs)
+        for _ in range(int(self.cfg.rl_updates_per_cycle)):
+            metrics.update(self.rl_alg.update())
+        if metrics:
+            self._last_rl_metrics.update(metrics)
+        return obs
 
     def _run_reward_updates(self) -> None:
-        if not self._has_reward_data():
+        if not self.irl_alg.can_update():
             return
-        for _ in range(self.reward_updates_per_cycle):
-            self._last_reward_loss, self._last_reward_grad_norm = self.irl_alg.reward_update()
+        metrics: dict[str, float] = {}
+        for _ in range(int(self.cfg.reward_updates_per_cycle)):
+            metrics.update(self.irl_alg.update())
+        if metrics:
+            self._last_reward_metrics.update(metrics)
 
-    def _log_iteration(self, iteration: int) -> None:
-        if self.writer is not None:
-            self.writer.add_scalar("IRL/reward_loss", self._last_reward_loss, iteration)
-            self.writer.add_scalar("IRL/reward_grad_norm", self._last_reward_grad_norm, iteration)
-            self.writer.add_scalar("RL/policy_loss", self._last_policy_loss, iteration)
-        if self.logger == "wandb":
-            self._ensure_wandb()
-            if _wandb_run is not None:
-                _wandb_run.log(
-                    {
-                        "IRL/reward_loss": self._last_reward_loss,
-                        "IRL/reward_grad_norm": self._last_reward_grad_norm,
-                        "RL/policy_loss": self._last_policy_loss,
-                    },
-                    step=iteration,
+    def _log(self, payload: dict[str, float]) -> None:
+        if not payload:
+            return
+        self.metric_logger.log(payload, step=self.global_timestep)
+
+    @staticmethod
+    def _scalar_payload(prefix: str, names: list[str], values: torch.Tensor) -> dict[str, float]:
+        """Build a ``{prefix/name: float(value)}`` dict from a [D] tensor."""
+        return {f"{prefix}/{name}": float(values[i].item()) for i, name in enumerate(names)}
+
+    def _log_iteration(self) -> None:
+        payload: dict[str, float] = {}
+        payload.update(self._last_reward_metrics)
+        payload.update(self._last_rl_metrics)
+        payload.update(self.rl_alg.train_metrics())
+        payload.update(self.irl_alg.train_metrics())
+        self._log(payload)
+
+    def _resolved_validation_steps(self) -> int:
+        if self.cfg.validation_interval <= 0:
+            return 0
+        if self.cfg.validation_steps_per_env is None:
+            return 5 * int(self.cfg.steps_per_env_per_cycle)
+        return int(self.cfg.validation_steps_per_env)
+
+    def _should_validate(self, learning_iteration: int) -> bool:
+        validation_steps = self._resolved_validation_steps()
+        return validation_steps > 0 and learning_iteration % int(self.cfg.validation_interval) == 0
+
+    def _feature_names(self, feature_dim: int) -> list[str]:
+        feature_names = self.irl_alg.feature_names
+        if feature_names is not None:
+            return list(feature_names)
+        return [f"feat_{feature_idx}" for feature_idx in range(feature_dim)]
+
+    def _make_success_accumulator(self) -> tuple[torch.Tensor | None, StepCallback | None]:
+        """Build a per-env any-time success accumulator for validation rollouts.
+
+        Returns ``(None, None)`` when no ``success_fn`` was configured. Otherwise
+        returns a ``[N]`` bool tensor and a step callback that ORs the current
+        env's success flags into it.
+        """
+        if self.success_fn is None:
+            return None, None
+        success_fn = self.success_fn
+        ever_success = torch.zeros(self._runtime_ctx.num_envs, dtype=torch.bool, device=self.device)
+
+        def _accumulate() -> None:
+            step_success = torch.as_tensor(success_fn(self.env)).reshape(-1).to(
+                device=ever_success.device, dtype=torch.bool
+            )
+            ever_success[step_success] = True
+
+        return ever_success, _accumulate
+
+    def _imitator_feature_expectations(
+        self,
+        obs: Any,
+        *,
+        mode: PolicyMode,
+        num_steps_per_env: int,
+    ) -> tuple[Any, torch.Tensor | None, float | None]:
+        """Roll out the policy (no training) and return (obs, per-feature expectations, success_rate)."""
+        scratch = FeatureTrajectoryBuffer(
+            cfg=replace(self.cfg.imitator_buffer, min_ep_len=1),
+            ctx=self._runtime_ctx,
+            gamma=float(self.irl_alg.gamma),
+        )
+        ever_success, on_step = self._make_success_accumulator()
+
+        def _scratch_sink(step: FeatureStep) -> None:
+            scratch.add_step(z=step.features, done=step.dones)
+
+        obs = self._rollout(
+            obs,
+            num_steps_per_env=num_steps_per_env,
+            action_fn=lambda o: self.rl_alg.act(o, mode=mode),
+            observe_rl=False,
+            feature_sink=_scratch_sink,
+            on_step=on_step,
+        )
+        scratch.finalize_in_progress_episodes()
+
+        success_rate = None if ever_success is None else float(ever_success.float().mean().item())
+        if len(scratch) == 0:
+            return obs, None, success_rate
+        feats, mask, _ = scratch.sample_episodes(batch_size=int(self.irl_alg.batch_size), device=self.device)
+        return obs, self.irl_alg.per_feature_return_mean(feats, mask), success_rate
+
+    def _run_validation(self, obs: Any, iteration: int) -> Any:
+        num_steps_per_env = self._resolved_validation_steps()
+        if num_steps_per_env <= 0:
+            return obs
+
+        self.eval_mode()
+        try:
+            self._log_validation_eval_metrics(iteration)
+            expert_mean, feature_names = self._log_validation_expert(iteration)
+            if expert_mean is None:
+                return obs
+            for mode_name, mode in (
+                ("stochastic", PolicyMode.TRAIN),
+                ("inference", PolicyMode.INFERENCE),
+            ):
+                obs = self._log_validation_mode(
+                    obs,
+                    iteration=iteration,
+                    mode_name=mode_name,
+                    mode=mode,
+                    num_steps_per_env=num_steps_per_env,
+                    expert_mean=expert_mean,
+                    feature_names=feature_names,
                 )
+        finally:
+            self.train_mode()
+        return obs
+
+    def _log_validation_eval_metrics(self, iteration: int) -> None:
+        metrics = self.rl_alg.eval_metrics()
+        if not metrics:
+            return
+        self._log(metrics)
+        self.console_reporter.validation_summary(iteration=iteration, metrics=metrics)
+
+    def _log_validation_expert(self, iteration: int) -> tuple[torch.Tensor | None, list[str]]:
+        expert_mean = self.irl_alg.sample_expert_feature_return_mean(self.device)
+        if expert_mean is None:
+            return None, []
+        feature_names = self._feature_names(expert_mean.shape[0])
+
+        expert_prefix = "ValidationFeatures/expert"
+        expert_payload = self._scalar_payload(expert_prefix, feature_names, expert_mean)
+        self._log(expert_payload)
+        self.console_reporter.validation_features(
+            iteration=iteration,
+            label="group=expert",
+            prefix=f"{expert_prefix}/",
+            payload=expert_payload,
+        )
+
+        expert_success_rate = self.irl_alg.expert_success_rate
+        if expert_success_rate is not None:
+            self._log({"Validation/expert/success_rate": float(expert_success_rate)})
+        return expert_mean, feature_names
+
+    def _log_validation_mode(
+        self,
+        obs: Any,
+        *,
+        iteration: int,
+        mode_name: str,
+        mode: PolicyMode,
+        num_steps_per_env: int,
+        expert_mean: torch.Tensor,
+        feature_names: list[str],
+    ) -> Any:
+        obs, imitator_mean, success_rate = self._imitator_feature_expectations(
+            obs, mode=mode, num_steps_per_env=num_steps_per_env,
+        )
+
+        summary: dict[str, float] = {}
+        expert_success_rate = self.irl_alg.expert_success_rate
+        if success_rate is not None:
+            summary[f"Validation/{mode_name}/success_rate"] = success_rate
+            if expert_success_rate is not None:
+                summary[f"Validation/{mode_name}/success_rate_gap"] = (
+                    float(expert_success_rate) - success_rate
+                )
+
+        if imitator_mean is not None:
+            imitator_mean = imitator_mean.to(device=expert_mean.device, dtype=expert_mean.dtype)
+            gap_mean = expert_mean - imitator_mean
+            summary[f"Validation/{mode_name}/feature_exp_diff_norm"] = float(gap_mean.norm().item())
+
+            imitator_prefix = f"ValidationFeatures/{mode_name}/imitator"
+            gap_prefix = f"ValidationFeatures/{mode_name}/gap"
+            imitator_payload = self._scalar_payload(imitator_prefix, feature_names, imitator_mean)
+            gap_payload = self._scalar_payload(gap_prefix, feature_names, gap_mean)
+            self._log({**imitator_payload, **gap_payload})
+            self.console_reporter.validation_features(
+                iteration=iteration,
+                label=f"mode={mode_name} group=imitator",
+                prefix=f"{imitator_prefix}/",
+                payload=imitator_payload,
+            )
+            self.console_reporter.validation_features(
+                iteration=iteration,
+                label=f"mode={mode_name} group=gap",
+                prefix=f"{gap_prefix}/",
+                payload=gap_payload,
+            )
+
+        self._log(summary)
+        self.console_reporter.validation_summary(
+            iteration=iteration, metrics=summary, label=f"mode={mode_name}"
+        )
+        return obs
 
     def _maybe_save_checkpoint(self, iteration: int) -> None:
         if self.log_dir is None:
             return
-        if (iteration + 1) % self.save_interval != 0:
+        if (iteration + 1) % int(self.cfg.save_interval) != 0:
             return
         self.save(os.path.join(self.log_dir, f"model_{iteration + 1}.pt"))
 
+    def finish_logger(self, exit_code: int = 0) -> None:
+        self.metric_logger.finish(exit_code=exit_code)
+
+    def record_final_rollouts(
+        self,
+        *,
+        recorder: Any,
+        video_length: int,
+        modes: tuple[tuple[str, PolicyMode], ...] = (
+            ("inference", PolicyMode.INFERENCE),
+            ("stochastic", PolicyMode.TRAIN),
+        ),
+    ) -> None:
+        """Drive the ``RecordVideo``-wrapped env for one clip per policy mode."""
+        if video_length <= 0:
+            return
+        self.eval_mode()
+        try:
+            obs = self._obs_to_device(self._get_obs())
+            for mode_name, mode in modes:
+                recorder.start_recording(f"final_{mode_name}")
+                obs = self._rollout(
+                    obs,
+                    num_steps_per_env=video_length,
+                    action_fn=lambda o, m=mode: self.rl_alg.act(o, mode=m),
+                    observe_rl=False,
+                )
+                if getattr(recorder, "recording", False):
+                    recorder.stop_recording()
+        finally:
+            self.train_mode()
+
     def train_mode(self) -> None:
-        policy = getattr(self.rl_alg, "policy", None)
-        if policy is not None:
-            policy.train()
-        self.irl_alg.reward.train()
+        self.rl_alg.train_mode()
+        self.irl_alg.train_mode()
 
     def eval_mode(self) -> None:
-        policy = getattr(self.rl_alg, "policy", None)
-        if policy is not None:
-            policy.eval()
-        self.irl_alg.reward.eval()
+        self.rl_alg.eval_mode()
+        self.irl_alg.eval_mode()
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
-        self._ensure_writer()
-
+        self.metric_logger.start()
 
         if init_at_random_ep_len and hasattr(self.env, "episode_length_buf") and hasattr(self.env, "max_episode_length"):
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
-        obs = self._get_obs().to(self.device)
+        obs = self._obs_to_device(self._get_obs())
         self.train_mode()
 
         start_iter = self.current_learning_iteration
-        print(f"[INFO] Starting learning for {int(num_learning_iterations)} iterations.")
+        self.console_reporter.start(int(num_learning_iterations))
         for it in range(start_iter, start_iter + int(num_learning_iterations)):
-            self.irl_alg.clear_imitator_storage()
-            obs = self._collect_rollout_batch(obs)
-            self._run_policy_updates()
+            obs = self._run_rl_updates(obs)
+            obs = self._collect_imitator_trajectories(obs)
             self._run_reward_updates()
+
             self.current_learning_iteration = it + 1
-            self._log_iteration(it)
-            print(
-                f"[INFO] iter {it + 1}  policy_loss={self._last_policy_loss:.4f}  "
-                f"reward_loss={self._last_reward_loss:.4f}  grad_norm={self._last_reward_grad_norm:.4f}"
+            self._log_iteration()
+            self.console_reporter.iteration_summary(
+                iteration=it,
+                rl_metrics=self._last_rl_metrics,
+                reward_metrics=self._last_reward_metrics,
             )
+
+            if self._should_validate(it + 1):
+                obs = self._run_validation(obs, it)
             self._maybe_save_checkpoint(it)
 
         if self.log_dir is not None:
@@ -247,38 +599,26 @@ class IrlRunner:
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        policy = getattr(self.rl_alg, "policy", None)
-        payload = {
+        payload: dict[str, Any] = {
             "iter": int(self.current_learning_iteration),
+            "global_timestep": int(self.global_timestep),
+            "rl_alg_state": self.rl_alg.save_state(),
+            "irl_alg_state": self.irl_alg.save_state(),
         }
-        if policy is not None:
-            payload["model_state_dict"] = policy.state_dict()
-        if hasattr(self.rl_alg, "optimizer") and self.rl_alg.optimizer is not None:
-            payload["optimizer_state_dict"] = self.rl_alg.optimizer.state_dict()
-        payload["reward_model_state_dict"] = self.irl_alg.reward.state_dict()
-        payload["reward_optimizer_state_dict"] = self.irl_alg.reward_optimizer.state_dict()
         torch.save(payload, path)
 
     def load(self, path: str, load_optimizer: bool = True):
         checkpoint = torch.load(path, map_location=self.device)
+        rl_alg_state = checkpoint.get("rl_alg_state")
+        irl_alg_state = checkpoint.get("irl_alg_state")
+        if rl_alg_state is None or irl_alg_state is None:
+            raise ValueError(
+                "Checkpoint must contain `rl_alg_state` and `irl_alg_state`. "
+                "Old flat checkpoints are not supported by the adapter runner."
+            )
 
-        model_state = checkpoint.get("model_state_dict")
-        policy = getattr(self.rl_alg, "policy", None)
-        if model_state is not None and policy is not None:
-            policy.load_state_dict(model_state)
-
-        if load_optimizer and hasattr(self.rl_alg, "optimizer") and self.rl_alg.optimizer is not None:
-            optim_state = checkpoint.get("optimizer_state_dict")
-            if optim_state is not None:
-                self.rl_alg.optimizer.load_state_dict(optim_state)
-
-        reward_state = checkpoint.get("reward_model_state_dict")
-        if reward_state is not None:
-            self.irl_alg.reward.load_state_dict(reward_state)
-
-        reward_optim_state = checkpoint.get("reward_optimizer_state_dict")
-        if load_optimizer and reward_optim_state is not None:
-            self.irl_alg.reward_optimizer.load_state_dict(reward_optim_state)
-
+        self.rl_alg.load_state(rl_alg_state, load_optimizer=load_optimizer)
+        self.irl_alg.load_state(irl_alg_state, load_optimizer=load_optimizer)
         self.current_learning_iteration = int(checkpoint.get("iter", 0))
+        self.global_timestep = int(checkpoint.get("global_timestep", 0))
         return checkpoint.get("infos", None)

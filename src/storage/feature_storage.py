@@ -7,7 +7,6 @@ import torch
 import torch.nn.utils.rnn as rnn_utils
 from einops import einsum, rearrange
 
-from reward_model.base import BaseRewardModel
 from utils.runtime_context import RuntimeContext
 
 
@@ -17,7 +16,7 @@ class FeatureBufCfg:
 
     capacity_steps: int = 1_000_000
     store_device: torch.device | str = "cpu"
-    store_dtype: torch.dtype = torch.float16
+    store_dtype: torch.dtype = torch.float32
     min_ep_len: int = 2
     sample_weighted_by_length: bool = False
 
@@ -94,6 +93,19 @@ class FeatureTrajectoryBuffer:
             # clone() avoids retaining a view into the full [N,D] tensor
             self._cur[i].append(z_store[i].clone())
             if bool(done_cpu[i].item()):
+                self._finalize(i)
+
+    def finalize_in_progress_episodes(self) -> None:
+        """Force-flush each env's in-progress episode into the completed deque.
+
+        Validation rolls out for a fixed horizon and typically does not see
+        natural episode ends, so the buffer would otherwise hold zero
+        completed episodes after the rollout. Callers that want fixed-length
+        trajectories (one per env) should call this after the rollout loop.
+        Respects ``cfg.min_ep_len``.
+        """
+        for i in range(self.ctx.num_envs):
+            if self._cur[i]:
                 self._finalize(i)
 
     def add_episode(self, feats: torch.Tensor) -> None:
@@ -211,78 +223,3 @@ class FeatureTrajectoryBuffer:
         powers = gamma ** torch.arange(t, device=r.device, dtype=r.dtype)
         return einsum(r, mask.to(dtype=r.dtype), powers, "b t, b t, t -> b")
 
-    @staticmethod
-    def eval_discounted_returns_from_model(
-        feats: torch.Tensor,
-        mask: torch.Tensor,
-        reward_model: BaseRewardModel,
-        gamma: float,
-    ) -> torch.Tensor:
-        """
-        Evaluate discounted returns from a reward model.
-
-        Args:
-            feats: [B, T, D]
-            mask: [B, T]
-            reward_model: feature-based reward model
-            gamma: discount factor
-
-        Returns:
-            returns: [B]
-        """
-        reward_param = next(reward_model.parameters(), None)
-        if reward_param is None:
-            model_device = feats.device
-            model_dtype = feats.dtype
-        else:
-            model_device = reward_param.device
-            model_dtype = reward_param.dtype
-
-        if bool(reward_model.is_linear):
-            discounted_feats = FeatureTrajectoryBuffer.discounted_feature_returns(feats, mask, gamma)
-            discounted_feats = discounted_feats.to(device=model_device, dtype=model_dtype)
-            rewards = reward_model.get_reward_from_features(discounted_feats)
-            if not isinstance(rewards, torch.Tensor):
-                rewards = torch.as_tensor(rewards, device=model_device, dtype=model_dtype)
-            if rewards.ndim == 2 and rewards.shape[-1] == 1:
-                rewards = rearrange(rewards, "b 1 -> b")
-            return rewards
-
-        feats = feats.to(device=model_device, dtype=model_dtype)
-        mask = mask.to(device=model_device, dtype=torch.bool)
-        rewards = reward_model.get_reward_from_features(feats, mask)
-        if not isinstance(rewards, torch.Tensor):
-            rewards = torch.as_tensor(rewards, device=model_device, dtype=model_dtype)
-        if rewards.ndim == 3 and rewards.shape[-1] == 1:
-            rewards = rearrange(rewards, "b t 1 -> b t")
-        return FeatureTrajectoryBuffer.discounted_returns(rewards, mask, gamma)
-
-    @torch.no_grad()
-    def sample_and_eval_returns(
-        self,
-        reward_model: BaseRewardModel,
-        batch_size: int,
-        device: torch.device | str,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Convenience helper for debugging/evaluation.
-
-        Returns:
-            feats   [B, T, D]
-            mask    [B, T]
-            lengths [B]
-            returns [B]
-        """
-        feats, mask, lengths = self.sample_episodes(batch_size=batch_size, device=device)
-        returns = self.eval_discounted_returns_from_model(
-            feats=feats,
-            mask=mask,
-            reward_model=reward_model,
-            gamma=self.gamma,
-        )
-        return {
-            "feats": feats,
-            "mask": mask,
-            "lengths": lengths,
-            "returns": returns,
-        }

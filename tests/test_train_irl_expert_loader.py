@@ -52,28 +52,86 @@ def test_load_feature_episodes_accepts_named_hdf5_payload(tmp_path: Path):
     module = _load_train_irl_module()
     payload_path = tmp_path / "expert.hdf5"
 
-    with h5py.File(payload_path, "w") as file_handle:
-        data_group = file_handle.create_group("data")
+    with h5py.File(payload_path, "w", track_order=True) as file_handle:
+        data_group = file_handle.create_group("data", track_order=True)
 
-        demo_0 = data_group.create_group("demo_0")
-        demo_0_features = demo_0.create_group("features")
+        demo_0 = data_group.create_group("demo_0", track_order=True)
+        demo_0_features = demo_0.create_group("features", track_order=True)
         demo_0_features.create_dataset("reach", data=torch.ones(3).numpy())
         demo_0_features.create_dataset("lift", data=(2.0 * torch.ones(3)).numpy())
 
-        demo_1 = data_group.create_group("demo_1")
-        demo_1_features = demo_1.create_group("features")
+        demo_1 = data_group.create_group("demo_1", track_order=True)
+        demo_1_features = demo_1.create_group("features", track_order=True)
         demo_1_features.create_dataset("reach", data=torch.zeros(4).numpy())
         demo_1_features.create_dataset("lift", data=torch.ones(4).numpy())
 
-    episodes = module.load_feature_episodes(str(payload_path), expected_feature_dim=2)
+    episodes = module.load_feature_episodes(
+        str(payload_path),
+        expected_feature_dim=2,
+        expected_feature_names=["reach", "lift"],
+    )
     assert len(episodes) == 2
     assert episodes[0].shape == (3, 2)
     assert episodes[1].shape == (4, 2)
-    # Feature columns are sorted by name: "lift" < "reach"
-    assert torch.allclose(episodes[0][:, 0], 2.0 * torch.ones(3))  # lift
-    assert torch.allclose(episodes[0][:, 1], torch.ones(3))  # reach
-    assert torch.allclose(episodes[1][:, 0], torch.ones(4))  # lift
-    assert torch.allclose(episodes[1][:, 1], torch.zeros(4))  # reach
+    assert torch.allclose(episodes[0][:, 0], torch.ones(3))  # reach
+    assert torch.allclose(episodes[0][:, 1], 2.0 * torch.ones(3))  # lift
+    assert torch.allclose(episodes[1][:, 0], torch.zeros(4))  # reach
+    assert torch.allclose(episodes[1][:, 1], torch.ones(4))  # lift
+
+
+def test_load_feature_episodes_rejects_hdf5_feature_name_mismatch(tmp_path: Path):
+    h5py = pytest.importorskip("h5py")
+    module = _load_train_irl_module()
+    payload_path = tmp_path / "expert_bad_names.hdf5"
+
+    with h5py.File(payload_path, "w", track_order=True) as file_handle:
+        data_group = file_handle.create_group("data", track_order=True)
+        demo_0 = data_group.create_group("demo_0", track_order=True)
+        demo_0_features = demo_0.create_group("features", track_order=True)
+        demo_0_features.create_dataset("reach", data=torch.ones(3).numpy())
+        demo_0_features.create_dataset("lift", data=torch.ones(3).numpy())
+
+    with pytest.raises(ValueError, match="feature-name mismatch"):
+        module.load_feature_episodes(
+            str(payload_path),
+            expected_feature_dim=2,
+            expected_feature_names=["reach", "success_bonus"],
+        )
+
+
+def test_load_expert_success_rate_any_time(tmp_path: Path):
+    h5py = pytest.importorskip("h5py")
+    module = _load_train_irl_module()
+    payload_path = tmp_path / "expert.hdf5"
+
+    with h5py.File(payload_path, "w") as file_handle:
+        data_group = file_handle.create_group("data")
+        # demo_0 reaches goal at some step -> any-time success.
+        d0 = data_group.create_group("demo_0")
+        d0.create_dataset("success", data=torch.tensor([0.0, 1.0, 0.0]).numpy())
+        # demo_1 never reaches goal.
+        d1 = data_group.create_group("demo_1")
+        d1.create_dataset("success", data=torch.tensor([0.0, 0.0]).numpy())
+
+    rate = module.load_expert_success_rate(str(payload_path))
+    assert rate == pytest.approx(0.5)
+
+
+def test_load_expert_success_rate_none_when_absent(tmp_path: Path):
+    h5py = pytest.importorskip("h5py")
+    module = _load_train_irl_module()
+    payload_path = tmp_path / "expert_nosuccess.hdf5"
+
+    with h5py.File(payload_path, "w") as file_handle:
+        data_group = file_handle.create_group("data")
+        demo_0 = data_group.create_group("demo_0")
+        demo_0_features = demo_0.create_group("features")
+        demo_0_features.create_dataset("reach", data=torch.ones(3).numpy())
+
+    # No 'success' dataset on any demo -> None (back-compat with old demos).
+    assert module.load_expert_success_rate(str(payload_path)) is None
+    # Non-HDF5 payloads also return None.
+    assert module.load_expert_success_rate(str(tmp_path / "x.pt")) is None
 
 
 def test_load_feature_episodes_rejects_legacy_hdf5_matrix_payload(tmp_path: Path):
@@ -132,7 +190,7 @@ def test_subset_episodes_random_same_seed_returns_same_subset():
         assert torch.allclose(a, b)
 
 
-def test_make_expert_buffer_loader_with_max_num_trajectories_loads_subset(tmp_path: Path):
+def test_install_expert_episodes_with_max_num_trajectories_loads_subset(tmp_path: Path):
     module = _load_train_irl_module()
     payload_path = tmp_path / "expert.pt"
     torch.save(
@@ -140,17 +198,25 @@ def test_make_expert_buffer_loader_with_max_num_trajectories_loads_subset(tmp_pa
         payload_path,
     )
 
+    from algorithms.irl import FeatureRewardLearner, IRLCfg
+    from reward_model import LinearFeatureRewardModel, RewardModelCfg
+    from storage.feature_storage import FeatureBufCfg
     from utils.runtime_context import RuntimeContext
-    from storage.feature_storage import FeatureBufCfg, FeatureTrajectoryBuffer
 
-    loader = module._make_expert_buffer_loader(
+    reward_model = LinearFeatureRewardModel(RewardModelCfg(num_features=2, is_linear=True))
+    irl_alg = FeatureRewardLearner(reward=reward_model, gamma=0.99, cfg=IRLCfg(batch_size=2))
+    irl_alg.init_expert_storage(
+        runtime_ctx=RuntimeContext(num_envs=1, feature_dim=2),
+        cfg=FeatureBufCfg(min_ep_len=1),
+        num_envs=1,
+    )
+
+    module._install_expert_episodes(
+        irl_alg,
         str(payload_path),
         expected_feature_dim=2,
         max_num_trajectories=1,
         subset_strategy="first",
         seed=42,
     )
-    ctx = RuntimeContext(num_envs=1, feature_dim=2)
-    buffer = FeatureTrajectoryBuffer(cfg=FeatureBufCfg(min_ep_len=1), ctx=ctx, gamma=0.99)
-    loader(buffer)
-    assert len(buffer) == 1
+    assert len(irl_alg.expert_storage) == 1

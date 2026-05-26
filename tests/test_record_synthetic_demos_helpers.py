@@ -55,6 +55,7 @@ def _install_recording_import_stubs(monkeypatch) -> dict[str, Any]:
     isaaclab_rl_module = types.ModuleType("isaaclab_rl")
     isaaclab_rl_rsl_rl_module = types.ModuleType("isaaclab_rl.rsl_rl")
     isaaclab_rl_rsl_rl_module.RslRlVecEnvWrapper = object
+    isaaclab_rl_rsl_rl_module.handle_deprecated_rsl_rl_cfg = lambda cfg, _v: cfg
     isaaclab_rl_module.rsl_rl = isaaclab_rl_rsl_rl_module
 
     isaaclab_tasks_module = types.ModuleType("isaaclab_tasks")
@@ -71,12 +72,15 @@ def _install_recording_import_stubs(monkeypatch) -> dict[str, Any]:
     reward_features_module = types.ModuleType("reward_features")
     reward_features_manager_based_module = types.ModuleType("reward_features.manager_based")
 
-    def _manager_based_reward_feature_dict(*, env, ignored_reward_terms=(), device=None):
+    def _manager_based_reward_feature_dict(
+        *, env, ignored_reward_terms=(), device=None, force_include_terms=()
+    ):
         state["manager_calls"].append(
             {
                 "env": env,
                 "ignored_reward_terms": set(ignored_reward_terms),
                 "device": device,
+                "force_include_terms": set(force_include_terms),
             }
         )
         return {

@@ -26,8 +26,8 @@ class RewardModelCfg:
 
     The reward model consumes features directly (not observations/actions).
 
-    MLP-only (when is_linear=False): hidden_dims, activation.
-    Linear-only (when is_linear=True): linear_projection, linear_projection_radius.
+    Dense model: hidden_dims, activation.
+    Linear model: linear_projection, linear_projection_radius.
     Both: regularization, regularization_strength, elastic_alpha.
     """
     num_features: int
@@ -35,7 +35,7 @@ class RewardModelCfg:
     is_linear: bool = False
     activation: str = "elu"
 
-    # Regularization (both MLP and linear)
+    # Regularization (both dense and linear)
     regularization: str = "none"  # "none" | "l1" | "l2" | "elastic"
     regularization_strength: float = 0.0
     elastic_alpha: float = 0.5  # L1 fraction when regularization=="elastic"
@@ -45,21 +45,16 @@ class RewardModelCfg:
     linear_projection_radius: float = 1.0
 
 
-class RewardModel(BaseRewardModel):
-    """
-    Reward model over features.
+class _FeatureRewardModelBase(BaseRewardModel):
+    """Common feature-reward model plumbing for [N, D] and [B, T, D] inputs."""
 
-    Supported input shapes:
-      - [N, D]     -> returns [N]
-      - [B, T, D]  -> returns [B, T]
-
-    `mask` is optional and used only for shape validation / optional zeroing.
-    """
-
-    def __init__(self, cfg: RewardModelCfg):
+    def __init__(self, cfg: RewardModelCfg) -> None:
         super().__init__()
         self.cfg = cfg
+        self._validate_common_cfg(cfg)
 
+    @staticmethod
+    def _validate_common_cfg(cfg: RewardModelCfg) -> None:
         if cfg.num_features <= 0:
             raise ValueError(f"`num_features` must be > 0, got {cfg.num_features}")
         if cfg.regularization not in _REGULARIZATION_OPTIONS:
@@ -72,59 +67,17 @@ class RewardModel(BaseRewardModel):
                 f"`linear_projection` must be one of {sorted(_LINEAR_PROJECTION_OPTIONS)}, "
                 f"got {cfg.linear_projection!r}."
             )
-        if not cfg.is_linear and cfg.linear_projection != "none":
-            raise ValueError(
-                "`linear_projection` is only valid when `is_linear` is True. "
-                f"Got is_linear={cfg.is_linear}, linear_projection={cfg.linear_projection!r}."
-            )
         if cfg.linear_projection_radius <= 0:
             raise ValueError(
                 f"`linear_projection_radius` must be > 0, got {cfg.linear_projection_radius}."
             )
 
-        self.reward = self._build_reward_network(cfg)
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
-    def _build_reward_network(self, cfg: RewardModelCfg) -> nn.Module:
-        if cfg.is_linear:
-            # Linear reward stays bias-free by design.
-            return nn.Linear(cfg.num_features, 1, bias=False)
-
-        hidden_dims = tuple(int(h) for h in cfg.hidden_dims)
-        if len(hidden_dims) == 0:
-            raise ValueError("`hidden_dims` must be non-empty for non-linear reward model.")
-
-        layers: list[nn.Module] = []
-        in_dim = cfg.num_features
-        act = get_activation(cfg.activation)
-
-        for h in hidden_dims:
-            if h <= 0:
-                raise ValueError(f"Hidden dims must be positive, got {hidden_dims}")
-            layers.append(nn.Linear(in_dim, h))
-            layers.append(act.__class__())  # fresh instance per layer
-            in_dim = h
-
-        layers.append(nn.Linear(in_dim, 1))
-        return nn.Sequential(*layers)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def reset(self, dones: torch.Tensor | None = None) -> None:
         # Stateless reward model
         del dones
 
-    @property
-    def is_linear(self) -> bool:
-        return bool(self.cfg.is_linear)
-
     def forward(self, feats: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Alias for compatibility with code calling `reward(feats, mask)`.
-        """
+        """Alias for compatibility with code calling ``reward(feats, mask)``."""
         return self.get_reward_from_features(feats, mask)
 
     def get_reward_from_features(
@@ -132,15 +85,11 @@ class RewardModel(BaseRewardModel):
         feats: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Compute per-step rewards from features.
+        """Compute per-step rewards from features.
 
         Args:
-            feats:
-                [N, D] or [B, T, D]
-            mask:
-                Optional boolean mask matching output shape ([N] or [B, T]).
-                Used for validation and zeroing padded outputs.
+            feats: [N, D] or [B, T, D]
+            mask: Optional boolean mask matching output shape ([N] or [B, T]).
 
         Returns:
             rewards with shape feats.shape[:-1]
@@ -150,6 +99,12 @@ class RewardModel(BaseRewardModel):
 
         if feats.ndim not in (2, 3):
             raise ValueError(f"`feats` must be [N,D] or [B,T,D], got {tuple(feats.shape)}")
+
+        if feats.shape[-1] != int(self.cfg.num_features):
+            raise ValueError(
+                f"Expected feature dimension D={self.cfg.num_features}, "
+                f"got feats shape {tuple(feats.shape)}."
+            )
 
         if feats.ndim == 2:
             # feats: [N, D] -> rewards: [N]
@@ -165,18 +120,23 @@ class RewardModel(BaseRewardModel):
         if mask is not None:
             if not isinstance(mask, torch.Tensor):
                 mask = torch.as_tensor(mask, device=rewards.device)
+            if tuple(mask.shape) != tuple(rewards.shape):
+                raise ValueError(
+                    "Expected mask shape to match reward shape, "
+                    f"got mask {tuple(mask.shape)} and rewards {tuple(rewards.shape)}."
+                )
             rewards = rewards * mask.to(dtype=rewards.dtype, device=rewards.device)
 
         return rewards
 
     def get_regularization_loss(self) -> torch.Tensor:
-        """L2 regularization penalty. Returns 0 when regularization is not L2."""
+        """Differentiable L2 regularization penalty. Returns 0 when disabled."""
         cfg = self.cfg
         if cfg.regularization != "l2" or cfg.regularization_strength <= 0:
             return super().get_regularization_loss()
         total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for p in self.parameters():
-            total = total + p.pow(2).sum()
+        for param in self.parameters():
+            total = total + param.pow(2).sum()
         return cfg.regularization_strength * total
 
     def apply_proximal_step(self) -> None:
@@ -192,44 +152,113 @@ class RewardModel(BaseRewardModel):
             lam1 = alpha * strength
             lam2 = (1.0 - alpha) * strength
         with torch.no_grad():
-            for p in self.parameters():
+            for param in self.parameters():
                 if cfg.regularization == "l1":
-                    p.data.copy_(soft_threshold(p.data, lam1))
+                    param.data.copy_(soft_threshold(param.data, lam1))
                 else:
-                    p.data.copy_(elastic_net_proximal(p.data, lam1, lam2))
+                    param.data.copy_(elastic_net_proximal(param.data, lam1, lam2))
 
-    def project_weights(self) -> None:
-        """Project linear layer weight onto L1 or L2 ball. No-op for MLP."""
-        cfg = self.cfg
-        if not cfg.is_linear or cfg.linear_projection == "none":
-            return
-        radius = float(cfg.linear_projection_radius)
-        linear_layer = self.reward
-        if not isinstance(linear_layer, nn.Linear):
-            return
-        w = linear_layer.weight.data
-        with torch.no_grad():
-            if cfg.linear_projection == "l2_ball":
-                projected = project_onto_l2_ball(w, radius)
-            else:
-                projected = project_onto_l1_ball(w, radius)
-            linear_layer.weight.data.copy_(projected)
+class DenseFeatureRewardModel(_FeatureRewardModelBase):
+    """Dense MLP reward model over features.
+
+    Supported input shapes:
+      - feats [N, D] -> rewards [N]
+      - feats [B, T, D], mask [B, T] -> rewards [B, T]
+    """
+
+    def __init__(self, cfg: RewardModelCfg) -> None:
+        if cfg.is_linear:
+            raise ValueError("DenseFeatureRewardModel requires cfg.is_linear=False.")
+        if cfg.linear_projection != "none":
+            raise ValueError(
+                "`linear_projection` is only valid for LinearFeatureRewardModel. "
+                f"Got linear_projection={cfg.linear_projection!r}."
+            )
+        super().__init__(cfg)
+        hidden_dims = tuple(int(hidden_dim) for hidden_dim in cfg.hidden_dims)
+        if len(hidden_dims) == 0:
+            raise ValueError("`hidden_dims` must be non-empty for DenseFeatureRewardModel.")
+        self.reward = self._build_reward_network(cfg, hidden_dims)
 
     @staticmethod
-    def init_weights(sequential: nn.Sequential, scales: list[float]) -> None:
+    def _build_reward_network(cfg: RewardModelCfg, hidden_dims: tuple[int, ...]) -> nn.Sequential:
+        layers: list[nn.Module] = []
+        in_dim = cfg.num_features
+        act = get_activation(cfg.activation)
+
+        for hidden_dim in hidden_dims:
+            if hidden_dim <= 0:
+                raise ValueError(f"Hidden dims must be positive, got {hidden_dims}")
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(act.__class__())  # fresh activation instance per layer
+            in_dim = hidden_dim
+
+        layers.append(nn.Linear(in_dim, 1))
+        return nn.Sequential(*layers)
+
+
+class LinearFeatureRewardModel(_FeatureRewardModelBase):
+    """Bias-free linear reward model over features.
+
+    Linearity lets discounted returns use the identity:
+    sum_t gamma^t r(f_t) == r(sum_t gamma^t f_t).
+    """
+
+    def __init__(self, cfg: RewardModelCfg) -> None:
+        if not cfg.is_linear:
+            raise ValueError("LinearFeatureRewardModel requires cfg.is_linear=True.")
+        super().__init__(cfg)
+        # Linear reward stays bias-free by design.
+        self.reward = nn.Linear(cfg.num_features, 1, bias=False)
+
+    def discounted_returns_from_features(
+        self,
+        feats: torch.Tensor,
+        mask: torch.Tensor,
+        gamma: float,
+    ) -> torch.Tensor:
+        """Evaluate discounted returns via discounted feature sums.
+
+        Args:
+            feats: [B, T, D]
+            mask:  [B, T]
+            gamma: discount factor
+
+        Returns:
+            discounted returns [B]
         """
-        Optional helper (not automatically used).
-        Applies orthogonal init to linear layers.
-        """
-        linear_layers = [m for m in sequential if isinstance(m, nn.Linear)]
-        if len(scales) != len(linear_layers):
+        self._validate_discount_inputs(feats, mask)
+        model_device, model_dtype = self._parameter_device_dtype(fallback=feats)
+        feats = feats.to(device=model_device, dtype=model_dtype)
+        mask = mask.to(device=model_device, dtype=torch.bool)
+        time_steps = feats.shape[1]
+        powers = gamma ** torch.arange(time_steps, device=feats.device, dtype=feats.dtype)
+        discounted_feats = torch.einsum("btd,bt,t->bd", feats, mask.to(dtype=feats.dtype), powers)
+        returns = self.get_reward_from_features(discounted_feats)  # [B]
+        if not isinstance(returns, torch.Tensor):
+            returns = torch.as_tensor(returns, device=model_device, dtype=model_dtype)
+        if returns.ndim == 2 and returns.shape[-1] == 1:
+            returns = returns.squeeze(-1)
+        if returns.ndim != 1 or returns.shape[0] != feats.shape[0]:
             raise ValueError(
-                f"`scales` length ({len(scales)}) must match number of linear layers ({len(linear_layers)})."
+                "Expected linear reward returns with shape [B], "
+                f"got {tuple(returns.shape)} for feats shape {tuple(feats.shape)}."
             )
-        for layer, gain in zip(linear_layers, scales):
-            nn.init.orthogonal_(layer.weight, gain=gain)
-            if layer.bias is not None:
-                nn.init.zeros_(layer.bias)
+        return returns
+
+    def project_weights(self) -> None:
+        """Project linear weights onto the configured L1 or L2 ball."""
+        cfg = self.cfg
+        if cfg.linear_projection == "none":
+            return
+        radius = float(cfg.linear_projection_radius)
+        weight = self.reward.weight.data
+        with torch.no_grad():
+            if cfg.linear_projection == "l2_ball":
+                projected = project_onto_l2_ball(weight, radius)
+            else:
+                projected = project_onto_l1_ball(weight, radius)
+            self.reward.weight.data.copy_(projected)
 
 
 def get_activation(name: str) -> nn.Module:
